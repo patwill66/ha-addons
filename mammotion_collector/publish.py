@@ -131,7 +131,12 @@ def push(states, token):
 
 
 def run(db_path, interval, stop, log):
+    # The base image's s6-overlay starts CMD with a cleared environment; the token stays in this file.
     token = os.environ.get("SUPERVISOR_TOKEN")
+    try:
+        token = token or open("/run/s6/container_environment/SUPERVISOR_TOKEN").read().strip()
+    except OSError:
+        pass
     if not token:
         log("no SUPERVISOR_TOKEN: not publishing sensors to Home Assistant")
         return
