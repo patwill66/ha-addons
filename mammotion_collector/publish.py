@@ -8,12 +8,14 @@ Assistant restart they reappear with the next publish. The device ID is never pu
 """
 import json
 import os
+import pathlib
 import sqlite3
 import urllib.request
 
 from collector.derive import CHARGING_VALUES, STATUS_CLASSES
 
 API = "http://supervisor/core/api/states/"
+APP = pathlib.Path(__file__).resolve().parent  # VERSION, SOURCE and CHANGELOG.md are baked into the image
 P = "LUBA "
 
 
@@ -119,7 +121,19 @@ def collect(db_path):
             "spacing": wp.get("channel_width") if wp else None, "observed_at": wp.get("observed_at") if wp else None,
             "saved_tasks": tasks}),
     }
+    out["sensor.luba_addon_version"] = addon_version()
     return out
+
+
+def addon_version():
+    def read(name):
+        try:
+            return (APP / name).read_text().strip()
+        except OSError:
+            return None
+    return (read("VERSION") or "unknown", {
+        "friendly_name": P + "Add-on version", "icon": "mdi:tag",
+        "collector_source": read("SOURCE"), "changelog": read("CHANGELOG.md")})
 
 
 def push(states, token):
