@@ -1,0 +1,27 @@
+name: "Mammotion Collector"
+description: "Polls the official Mammotion API for the LUBA mower and keeps its history in SQLite (/share/mammotion_collector)."
+version: "0.2.0"
+slug: "mammotion_collector"
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+# Publishes sensor.luba_* states through the Supervisor's Home Assistant API.
+homeassistant_api: true
+# The database and lock live in /share/mammotion_collector (see run.py).
+map:
+  - share:rw
+options:
+  client_id: ""
+  client_secret: ""
+  poll_seconds: 30
+  verbose: false
+  publish_sensors: true
+schema:
+  client_id: str
+  client_secret: password
+  poll_seconds: int(10,600)
+  verbose: bool
+  publish_sensors: bool
