@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 (2026-10-08)
+
+- `tracked_devices` entries can carry a friendly name: `desktop-1006 = Array Desktop` names the HA device.
+- Hostnames match with or without eero's trailing dot, and the dot is dropped from displayed names.
+
 ## 0.1.0 (2026-10-08)
 
 - First version. Read-only eero collector: network, node and client snapshots every 5 minutes, eero's

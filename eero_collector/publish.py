@@ -171,6 +171,12 @@ def client_configs(d, version):
     return b.configs
 
 
+def parse_tracked(entry):
+    """'desktop-1006 = Array Desktop' -> ('desktop-1006', 'Array Desktop'); 'Living Room TV' -> (it, None)."""
+    key, _, alias = entry.partition("=")
+    return key.strip(), alias.strip() or None
+
+
 # --- states -----------------------------------------------------------------------------------------------
 def collect(db_path, tracked, tz, version, source):
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
@@ -193,13 +199,18 @@ def collect(db_path, tracked, tz, version, source):
                 st[f"radio_{band_slug(r['band'])}"] = {k: r[k] for k in ("channel", "width_mhz", "tx_power",
                                                                          "utilization", "clients")}
             node_states[n["id"]] = st
-        ids, missing = report.find_devices(db, tracked)
+        entries = [parse_tracked(t) for t in tracked]
+        ids, missing = report.find_devices(db, [key for key, _ in entries])
+        aliases = {}
+        for (key, alias), did in zip([e for e in entries if e[0] not in missing], ids):
+            aliases[did] = alias
         clients = {}
         for did in ids:
             d = report.device_now(db, did, now, tz)
             if d:
                 s = d["sample"] or {}
-                clients[did] = {"name": d["name"], "manufacturer": d.get("manufacturer"),
+                clients[did] = {"name": aliases.get(did) or d["name"], "eero_name": d["name"],
+                                "manufacturer": d.get("manufacturer"),
                                 "device_type": d.get("device_type"), "connected": bool(d.get("connected")),
                                 "node": d.get("node"), "band": d.get("band"), "signal": s.get("signal"),
                                 "score_bars": s.get("score_bars"), "rx_rate_mbps": s.get("rx_rate_mbps"),

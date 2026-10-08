@@ -1,6 +1,6 @@
 name: "eero Collector"
 description: "Read-only history of an eero mesh network (clients, Wi-Fi quality, usage, mesh health) in SQLite, published to Home Assistant over MQTT."
-version: "0.1.0"
+version: "0.1.1"
 slug: "eero_collector"
 arch:
   - aarch64

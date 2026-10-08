@@ -38,7 +38,9 @@ def local_midnight(now, tz):
 
 
 def device_name(d):
-    return d.get("nickname") or d.get("display_name") or d.get("hostname") or d.get("mac")
+    """eero's nickname, else its display name or hostname (without the DNS trailing dot), else the MAC."""
+    name = d.get("nickname") or d.get("display_name") or d.get("hostname")
+    return name.rstrip(".") if name else d.get("mac")
 
 
 def network(db, now, tz, db_path=None):
@@ -154,12 +156,14 @@ def device_series(db, device_id, now, days=7):
 
 
 def find_devices(db, keys):
-    """Device ids for user-given names or MACs (case-insensitive); unknown keys are returned separately."""
+    """Device ids for user-given names or MACs (case-insensitive; hostnames with or without the trailing dot).
+    Unknown keys are returned separately."""
     found, missing = [], []
     for key in keys:
-        k = key.strip().lower()
-        row = db.execute("""SELECT id FROM devices WHERE lower(mac)=? OR lower(nickname)=? OR lower(display_name)=?
-            OR lower(hostname)=? ORDER BY connected DESC, last_connected_at DESC LIMIT 1""", (k, k, k, k)).fetchone()
+        k = key.strip().lower().rstrip(".")
+        row = db.execute("""SELECT id FROM devices WHERE lower(mac)=? OR lower(rtrim(nickname, '.'))=?
+            OR lower(rtrim(display_name, '.'))=? OR lower(rtrim(hostname, '.'))=?
+            ORDER BY connected DESC, last_connected_at DESC LIMIT 1""", (k, k, k, k)).fetchone()
         (found if row else missing).append(row[0] if row else key)
     return found, missing
 

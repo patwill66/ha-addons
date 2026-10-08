@@ -37,7 +37,7 @@ the collector starts fetching them on its next daily run, with no reconfiguratio
 |---|---|
 | `poll_seconds` | Snapshot interval (default 300; minimum 120) |
 | `publish_seconds` | How often sensors are refreshed in HA (default 60) |
-| `tracked_devices` | Names or MACs of clients to get their own HA device (connected, node, band, signal, link quality, data today/last hour) |
+| `tracked_devices` | Clients that get their own HA device (connected, node, band, signal, link quality, data today/last hour). Each entry is an eero name, hostname or MAC, optionally with a friendly name: `desktop-1006 = Array Desktop`. The Web UI's Devices page shows the names. |
 | `backfill`, `backfill_device_hourly` | Fetch eero's stored history (network and per-device) on first run |
 | `sample_retention_days` | Keep 5-minute client samples this long; older ones are kept as hourly summaries |
 | `timezone` | Time zone for "today" (eero's day boundaries) |
