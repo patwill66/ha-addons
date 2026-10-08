@@ -12,7 +12,8 @@ or /share/mammotion/mammotion.db (a copy of the Mac collector's database). Stop 
 (scripts/service.sh stop) before copying it: only one collector may hold the Mammotion credentials.
 
 Unless `publish_sensors` is off, publish.py runs alongside it in a thread and mirrors what has been
-logged into sensor.luba_* states in Home Assistant, for the "LUBA Mower" dashboard.
+logged into sensor.luba_* states in Home Assistant, for the "LUBA Mower" dashboard. snapshot_server.py
+runs in another thread and serves read-only database snapshots through ingress.
 
 The collector is restarted after a crash (60 s later, like launchd's ThrottleInterval), but not after
 a clean stop, missing or refused credentials (exit 2) or "already running" (exit 75).
@@ -29,6 +30,7 @@ import threading
 import time
 
 import publish
+import snapshot_server
 
 OPTIONS = pathlib.Path("/data/options.json")
 DB_DIR = pathlib.Path("/share/mammotion_collector")
@@ -92,6 +94,7 @@ def main():
     if options.get("publish_sensors", True):
         threading.Thread(target=publish.run, daemon=True,
                          args=(str(DB), int(options.get("poll_seconds", 30)), stop_publishing, log)).start()
+    threading.Thread(target=snapshot_server.run, daemon=True, args=(str(DB), log)).start()
 
     def forward(signum, _frame):
         nonlocal stopping

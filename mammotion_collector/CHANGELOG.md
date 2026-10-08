@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0 (2026-10-08)
+- New: **database snapshots through ingress.** **Open Web UI** (or `GET /snapshot`) downloads a consistent copy of the database, made with SQLite's online backup API from a read-only connection while the collector keeps running. Only Home Assistant's ingress proxy can connect, so it needs a logged-in Home Assistant user and adds no credentials. `tools/pull_mammotion_snapshot.py` in the home-assistant repo uses it to pull snapshots to the Mac.
+- The collector itself is unchanged.
+
 ## 0.2.2 (2026-10-07)
 - New `sensor.luba_addon_version`: the running version, the collector commit and this changelog, shown on the LUBA Mower dashboard's **About** tab.
 - This changelog now also appears in Home Assistant's update dialog.

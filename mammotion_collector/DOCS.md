@@ -27,4 +27,17 @@ from collecting at once.
 - The sensors are set through the Home Assistant API. They have no unique ID, and after a Home
   Assistant restart they come back on the next poll.
 
+## Snapshots
+
+**Open Web UI** shows a link that downloads a consistent copy of the database (`mammotion-<UTC time>.db`).
+It's made with SQLite's online backup API from a read-only connection, so it includes rows that are still
+in the `-wal` file, and the collector keeps running. The copy is made in the container's temporary storage
+and deleted after it's sent. The response's `X-Snapshot-Sha256` header carries its SHA-256.
+
+The server listens on the ingress port (8099) and only answers Home Assistant's ingress proxy, so every
+download needs a logged-in Home Assistant user (or a token that can open an ingress session). It has no
+credentials of its own and never writes to the database. Outside the UI, open an ingress session through
+the Supervisor API (`POST /ingress/session`) and request `<ingress_url>snapshot` with the
+`ingress_session` cookie.
+
 The collector itself is maintained in a separate repository; `SOURCE` records the commit it was built from.
