@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 (2026-10-08)
+- Collector **derivation v2** (mammotion-luba `fcb926b`): a new `meta` table (schema migration 2) records the rules' version. On the first start the collector rebuilds all state events and sessions, logging "Derivation rules changed (now v2): rebuilt state events and sessions". A mowing session now ends at the last real observation once the mower has been offline for more than 10 minutes. If it was stuck (`paused_off_dock`), the end reason is `stuck_powered_off`.
+- New `sensor.luba_condition`: the mower's condition from the collector's own rules (`derive.current_condition`), such as `docked_waiting`, `paused_off_dock` or `stuck_powered_off`. It has the attributes `label`, `attention`, `last_known_state`, `last_known_at` and `last_known_battery`.
+- New `binary_sensor.luba_needs_attention` (problem): on while the mower is stuck in the yard, or has powered off there after getting stuck.
+- The other sensors are unchanged.
+
 ## 0.3.0 (2026-10-08)
 - New: **database snapshots through ingress.** **Open Web UI** (or `GET /snapshot`) downloads a consistent copy of the database, made with SQLite's online backup API from a read-only connection while the collector keeps running. Only Home Assistant's ingress proxy can connect, so it needs a logged-in Home Assistant user and adds no credentials. `tools/pull_mammotion_snapshot.py` in the home-assistant repo uses it to pull snapshots to the Mac.
 - The collector itself is unchanged.

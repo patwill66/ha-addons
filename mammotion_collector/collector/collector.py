@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 
 from .api import ApiError, AuthError, TransientError
 from .config import mask, seconds_between, utcnow
-from .derive import TRACKED_FIELDS, SessionDeriver, classify, detect_changes, has_telemetry
+from .derive import (DERIVATION_VERSION, TRACKED_FIELDS, SessionDeriver, classify, detect_changes,
+                     ensure_derived_current, has_telemetry)
 from .models import device_meta, normalize_detail, normalize_work_params, raw_detail_json
 
 log = logging.getLogger("collector")
@@ -84,6 +85,8 @@ class Collector:
         orphaned = self.store.close_orphaned_runs(self.now())
         if orphaned:
             log.warning("Previous run(s) ended without a clean shutdown: %d", orphaned)
+        if ensure_derived_current(self.store, self.s.gap_threshold_seconds):
+            log.info("Derivation rules changed (now v%d): rebuilt state events and sessions", DERIVATION_VERSION)
         self.run_id = self.store.start_run(self.now(), self.s.poll_seconds)
         log.info("Collector started (run #%s, poll every %ss, db %s)", self.run_id, self.s.poll_seconds, self.s.db_path.name)
         reason = "stopped"
@@ -180,6 +183,8 @@ class Collector:
                 log.info("Poll returned no device state (online=%s); keeping previous state", s["online"])
             for event_type, old, new in r.changes:  # e.g. online 1 → 0 still matters
                 log.info("Event %s: %s → %s", event_type, old, new)
+            for note in r.notes:  # e.g. a session closed because the mower stayed offline
+                log.info("Session: %s", note)
             return
         if r.prev is None:
             log.info("First observation: %s, battery %s%%, charging %s", s["raw_status"], s["battery_level"], s["charge_status"])

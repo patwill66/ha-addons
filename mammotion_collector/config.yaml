@@ -1,6 +1,6 @@
 name: "Mammotion Collector"
 description: "Polls the official Mammotion API for the LUBA mower and keeps its history in SQLite (/share/mammotion_collector)."
-version: "0.3.0"
+version: "0.4.0"
 slug: "mammotion_collector"
 arch:
   - aarch64

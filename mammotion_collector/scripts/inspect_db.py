@@ -10,6 +10,7 @@
   python3 scripts/inspect_db.py tasks
   python3 scripts/inspect_db.py work-params [-n 5]
   python3 scripts/inspect_db.py runs [-n 10]
+  python3 scripts/inspect_db.py incidents          # periods paused off the dock (stuck), with faults
   python3 scripts/inspect_db.py rebuild           # recompute events + sessions from telemetry (writes)
 """
 
@@ -17,11 +18,13 @@ import argparse
 import json
 import sqlite3
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from collector.config import Settings, mask  # noqa: E402
+from collector.config import Settings, mask, seconds_between  # noqa: E402
+from collector.derive import ATTENTION_STATES, operational_state  # noqa: E402
 
 
 def table(rows, cols):
@@ -43,7 +46,7 @@ def mins(seconds):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["status", "recent", "events", "mowing-sessions", "charging-sessions",
-                                        "errors", "tasks", "work-params", "runs", "rebuild", "rebuild-sessions"])
+                                        "errors", "tasks", "work-params", "runs", "incidents", "rebuild", "rebuild-sessions"])
     ap.add_argument("-n", type=int, default=20, help="rows to show")
     ap.add_argument("--db", help="database path (default MAMMOTION_DB_PATH or data/mammotion.db)")
     args = ap.parse_args()
@@ -74,6 +77,13 @@ def main() -> int:
             s = q("SELECT * FROM telemetry_samples WHERE device_id=? ORDER BY observed_at DESC, id DESC LIMIT 1", d["id"])
             if s:
                 s = s[0]
+                last_real = q("SELECT * FROM telemetry_samples WHERE device_id=? AND raw_status IS NOT NULL"
+                              " ORDER BY observed_at DESC, id DESC LIMIT 1", d["id"])
+                state = operational_state(s)
+                if state in ("offline", "no_data") and last_real:
+                    state += f" (last known: {operational_state(last_real[0])} at {last_real[0]['observed_at']}, " \
+                             f"battery {last_real[0]['battery_level']}%)"
+                print(f"  state   {state}{'  ⚠ needs attention' if operational_state(s) in ATTENTION_STATES else ''}")
                 print(f"  latest  {s['observed_at']}: {s['raw_status']}, battery {s['battery_level']}%, "
                       f"charging {s['charge_status']}, online {s['online']}, network {s['used_network']}, "
                       f"wifi {s['wifi_rssi']} dBm, cell {s['cellular_rssi']} dBm")
@@ -127,6 +137,31 @@ def main() -> int:
         table(q("SELECT * FROM work_parameter_snapshots ORDER BY observed_at DESC LIMIT ?", n),
               ["observed_at", "reason", "knife_height", "speed", "channel_width", "channel_mode", "job_content",
                "edge_mode", "toward_mode", "toward_included_angle", "ultra_wave", "forbidden_area_circle_times"])
+    elif args.command == "incidents":
+        incidents, cur, prev_state = [], None, None
+        for s in q("SELECT * FROM telemetry_samples ORDER BY observed_at, id"):
+            st = operational_state(s)
+            if st == "no_data":
+                continue
+            if st in ATTENTION_STATES:
+                if cur is None:
+                    cur = {"started_at": s["observed_at"], "start_battery": s["battery_level"], "before": prev_state}
+                cur.update(last_seen=s["observed_at"], end_battery=s["battery_level"])
+            elif cur is not None:
+                cur["then"] = st
+                incidents.append(cur)
+                cur = None
+            prev_state = st
+        if cur is not None:
+            cur["then"] = "(still in progress)"
+            incidents.append(cur)
+        for i in incidents:
+            i["minutes"] = mins(seconds_between(i["started_at"], i["last_seen"]))
+            lo = (datetime.fromisoformat(i["started_at"]) - timedelta(minutes=10)).isoformat(timespec="seconds")
+            hi = (datetime.fromisoformat(i["last_seen"]) + timedelta(minutes=10)).isoformat(timespec="seconds")
+            i["faults"] = ", ".join(str(r["code"]) for r in q(
+                "SELECT code FROM error_events WHERE occurred_at BETWEEN ? AND ? ORDER BY gmt_create_ms", lo, hi)) or "-"
+        table(incidents, ["started_at", "last_seen", "minutes", "before", "start_battery", "end_battery", "then", "faults"])
     elif args.command == "runs":
         table(q("SELECT * FROM collector_runs ORDER BY id DESC LIMIT ?", n)[::-1],
               ["id", "started_at", "ended_at", "poll_seconds", "auth_count", "polls_ok", "polls_failed", "stop_reason"])

@@ -24,6 +24,13 @@ from collecting at once.
 - On first start, if there's no database yet, it restores one from `/data/mammotion.db` (versions
   before 0.2.0) or from `/share/mammotion/mammotion.db` (a copy of an existing collector database).
 - `/share` is part of Home Assistant's full backups. The database grows by about 1 MB a day.
+- `sensor.luba_condition` and `binary_sensor.luba_needs_attention` come from the collector's
+  `derive.current_condition()`. It's documented in mammotion-luba's `docs/DATA_INTERPRETATION.md`, so
+  Home Assistant shows the same interpretation as the analysis. `stuck_powered_off` means the mower went
+  offline while it was stuck off the dock. It has powered itself off, and someone must free it and press
+  its power button.
+- When the collector's derivation rules change, it rebuilds state events and sessions from the stored
+  samples on its next start. The log then says "Derivation rules changed".
 - The sensors are set through the Home Assistant API. They have no unique ID, and after a Home
   Assistant restart they come back on the next poll.
 

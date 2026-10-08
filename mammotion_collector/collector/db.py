@@ -129,6 +129,10 @@ MIGRATIONS = [
     );
     CREATE INDEX ix_charging_device_time ON charging_sessions(device_id, started_at);
     """,
+    # 2 — key/value metadata (e.g. derivation_version)
+    """
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+    """,
 ]
 
 SAMPLE_FIELDS = ("observed_at", "online", "raw_status", "battery_level", "charge_status", "used_network",
@@ -180,6 +184,15 @@ class Store:
             return self.conn.execute(
                 "UPDATE collector_runs SET ended_at = ?, stop_reason = 'ended without clean shutdown"
                 " (detected at next start)' WHERE ended_at IS NULL", (ended_at,)).rowcount
+
+    def get_meta(self, key: str):
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.conn:
+            self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)"
+                              " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
 
     def update_run(self, run_id: int, **fields) -> None:
         with self.conn:

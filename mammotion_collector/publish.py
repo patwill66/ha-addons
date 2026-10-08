@@ -3,8 +3,9 @@
 Every `interval` seconds it reads the database read-only (WAL lets it read while the collector
 writes) and POSTs the states through the Supervisor's Home Assistant API (homeassistant_api: true).
 The values come from the database, not the Mammotion API, so the sensors show what was actually
-logged. States set this way have no unique_id: they can't be edited in the UI, and after a Home
-Assistant restart they reappear with the next publish. The device ID is never published.
+logged; sensor.luba_condition and binary_sensor.luba_needs_attention use the collector's
+current_condition(). States set this way have no unique_id: they can't be edited in the UI, and after
+a Home Assistant restart they reappear with the next publish. The device ID is never published.
 """
 import json
 import os
@@ -12,7 +13,7 @@ import pathlib
 import sqlite3
 import urllib.request
 
-from collector.derive import CHARGING_VALUES, STATUS_CLASSES
+from collector.derive import CHARGING_VALUES, STATUS_CLASSES, current_condition
 
 API = "http://supervisor/core/api/states/"
 APP = pathlib.Path(__file__).resolve().parent  # VERSION, SOURCE and CHANGELOG.md are baked into the image
@@ -50,6 +51,12 @@ def collect(db_path):
         chgs = one(db, "SELECT count(*) AS n FROM charging_sessions")["n"]
         tasks = [r["task_name"] for r in rows(db, "SELECT task_name FROM saved_tasks WHERE is_present = 1 ORDER BY task_name")]
         wp = one(db, "SELECT observed_at, knife_height, channel_width, speed FROM work_parameter_snapshots ORDER BY id DESC LIMIT 1")
+        # The condition comes from the collector's own rules (derive.current_condition), so HA shows
+        # exactly what docs/DATA_INTERPRETATION.md in mammotion-luba defines.
+        condition = current_condition(
+            db.execute("SELECT * FROM telemetry_samples ORDER BY observed_at DESC, id DESC LIMIT 1").fetchone(),
+            db.execute("SELECT * FROM telemetry_samples WHERE raw_status IS NOT NULL "
+                       "ORDER BY observed_at DESC, id DESC LIMIT 1").fetchone())
     finally:
         db.close()
 
@@ -121,6 +128,13 @@ def collect(db_path):
             "spacing": wp.get("channel_width") if wp else None, "observed_at": wp.get("observed_at") if wp else None,
             "saved_tasks": tasks}),
     }
+    attention = condition["attention"]
+    out["sensor.luba_condition"] = (condition["state"] or "unknown", {
+        "friendly_name": P + "Condition", "icon": "mdi:alert" if attention else "mdi:robot-mower",
+        **{k: condition[k] for k in ("label", "attention", "last_known_state", "last_known_at", "last_known_battery")}})
+    out["binary_sensor.luba_needs_attention"] = ("on" if attention else "off", {
+        "friendly_name": P + "Needs attention", "device_class": "problem",
+        "label": condition["label"], "last_known_battery": condition["last_known_battery"]})
     out["sensor.luba_addon_version"] = addon_version()
     return out
 

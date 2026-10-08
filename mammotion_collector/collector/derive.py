@@ -16,6 +16,10 @@ import json
 
 from .config import seconds_between
 
+# Bump whenever any rule in this module changes. The collector compares it with the value stored
+# in the database at startup and rebuilds all events and sessions if they differ.
+DERIVATION_VERSION = 2
+
 # Raw status -> behavioral class. Extend freely; unknown statuses classify as "other" and are
 # still stored verbatim in telemetry_samples.raw_status. Only exact strings seen live (or
 # documented with clear meaning) are mapped.
@@ -56,6 +60,75 @@ def is_charging(sample) -> bool:
     return sample["charge_status"] in CHARGING_VALUES
 
 
+# chargeStatus values seen only while on the dock (1/2 charging, 5 charge complete). 0 means not
+# on charge — every TaskPaused + 0 observed so far was the mower stuck off the dock (user-
+# confirmed 2026-10-08). See docs/DATA_INTERPRETATION.md.
+DOCKED_VALUES = {1, 2, 5}
+
+# Operational states (derived per sample from status + chargeStatus + online):
+#   mowing, returning, docked_charging, docked_waiting (job pending, e.g. do-not-operate window),
+#   docked_charged, paused_off_dock (needs attention), offline, no_data, other
+ATTENTION_STATES = {"paused_off_dock"}
+
+
+def operational_state(sample):
+    """What the mower is doing, combining status, chargeStatus and online. None for no sample."""
+    if sample is None:
+        return None
+    if sample["online"] == 0:
+        return "offline"
+    if not has_telemetry(sample):
+        return "no_data"
+    cls = classify(sample)
+    if cls == "mowing":
+        return "mowing"
+    if cls == "returning":
+        return "returning"
+    if sample["charge_status"] in DOCKED_VALUES:
+        if is_charging(sample):
+            return "docked_charging"
+        return "docked_waiting" if cls == "paused" else "docked_charged"
+    if cls == "paused" and sample["charge_status"] == 0:
+        return "paused_off_dock"
+    return "other"
+
+
+# Display names for dashboards. "stuck_powered_off" only comes from current_condition().
+STATE_LABELS = {
+    "mowing": "Mowing",
+    "returning": "Returning to dock",
+    "docked_charging": "Docked, charging",
+    "docked_waiting": "Docked, job pending",
+    "docked_charged": "Docked, charged",
+    "paused_off_dock": "Stuck (paused off the dock)",
+    "stuck_powered_off": "Powered off in the yard after getting stuck",
+    "offline": "Offline",
+    "no_data": "No data",
+    "other": "Unknown state",
+}
+CONDITION_ATTENTION = {"paused_off_dock", "stuck_powered_off"}
+
+
+def current_condition(latest, last_real) -> dict:
+    """What a dashboard should show right now, from the latest sample and the last sample that
+    had device state. An offline mower whose last known state was paused_off_dock has powered
+    itself off while stuck (user-confirmed 2026-10-08): someone must press its power button."""
+    state = operational_state(latest)
+    last_known = operational_state(last_real)
+    if state == "offline" and last_known == "paused_off_dock":
+        state = "stuck_powered_off"
+    elif state == "no_data" and last_known is not None:
+        state = last_known  # incomplete response: keep showing the last known state
+    return {
+        "state": state,
+        "label": STATE_LABELS.get(state, state),
+        "attention": state in CONDITION_ATTENTION,
+        "last_known_state": last_known,
+        "last_known_at": last_real["observed_at"] if last_real else None,
+        "last_known_battery": last_real["battery_level"] if last_real else None,
+    }
+
+
 def has_telemetry(sample) -> bool:
     """False for payloads that omit the device state (offline or incomplete responses)."""
     return sample is not None and sample["raw_status"] is not None
@@ -81,16 +154,18 @@ def _reasons(existing, *new) -> str:
 class SessionDeriver:
     MOWING, CHARGING = "mowing_sessions", "charging_sessions"
 
-    def __init__(self, store, device_id: int, gap_threshold_seconds: int = 180):
+    def __init__(self, store, device_id: int, gap_threshold_seconds: int = 180, offline_close_seconds: int = 600):
         self.store = store
         self.device_id = device_id
         self.gap_threshold = gap_threshold_seconds
+        self.offline_close = offline_close_seconds
 
     def apply(self, sample, prev) -> list[str]:
         """Feed one stored sample and the last earlier sample that *had* telemetry.
-        Samples without telemetry are ignored here (see module docstring)."""
+        Samples without telemetry don't change sessions, except that a mowing session is closed
+        once the mower has been offline for longer than offline_close_seconds."""
         if not has_telemetry(sample):
-            return []
+            return self._close_if_lost(sample, prev)
         gap = seconds_between(prev["observed_at"], sample["observed_at"]) if prev else None
         gap_note = (f"{gap}s without observations before {sample['observed_at']}"
                     if gap is not None and gap > self.gap_threshold else None)
@@ -148,6 +223,30 @@ class SessionDeriver:
                          + (" (start uncertain)" if reasons else ""))
         return notes
 
+    def _close_if_lost(self, s, last_real) -> list[str]:
+        """Offline long enough mid-job: end the mowing session at the last real observation.
+        If the mower was stuck off the dock, it has powered itself off (user-confirmed)."""
+        if s["online"] != 0 or last_real is None:
+            return []
+        open_ = self.store.open_session(self.MOWING, self.device_id)
+        if not open_ or seconds_between(last_real["observed_at"], s["observed_at"]) <= self.offline_close:
+            return []
+        stuck = operational_state(last_real) == "paused_off_dock"
+        reason = "stuck_powered_off" if stuck else "offline"
+        fields = {
+            "ended_at": last_real["observed_at"], "end_sample_id": last_real["id"], "last_sample_id": last_real["id"],
+            "end_battery": last_real["battery_level"], "battery_used": _diff(open_["start_battery"], last_real["battery_level"]),
+            "lowest_battery": _min(open_["lowest_battery"], last_real["battery_level"]),
+            "elapsed_seconds": seconds_between(open_["started_at"], last_real["observed_at"]),
+            "end_status": last_real["raw_status"], "end_reason": reason,
+        }
+        if not stuck:
+            fields.update(uncertain=1, uncertain_reasons=_reasons(
+                open_["uncertain_reasons"], "went offline mid-job; end time is the last observation"))
+        self.store.update_session(self.MOWING, open_["id"], fields)
+        return [f"mowing session #{open_['id']} ended ({reason}) at {last_real['observed_at']}, "
+                f"battery {open_['start_battery']}→{last_real['battery_level']}%"]
+
     # --- charging -----------------------------------------------------------------------------
     def _charging(self, s, prev, gap_note) -> list[str]:
         notes = []
@@ -197,6 +296,16 @@ def _min(a, b):
 def _max(a, b):
     vals = [x for x in (a, b) if x is not None]
     return max(vals) if vals else None
+
+
+def ensure_derived_current(store, gap_threshold_seconds: int = 180) -> bool:
+    """Rebuild events and sessions for every device if they were derived by older rules."""
+    if store.get_meta("derivation_version") == str(DERIVATION_VERSION):
+        return False
+    for (device_id,) in store.conn.execute("SELECT id FROM devices").fetchall():
+        rebuild_derived(store, device_id, gap_threshold_seconds)
+    store.set_meta("derivation_version", str(DERIVATION_VERSION))
+    return True
 
 
 def rebuild_derived(store, device_id: int, gap_threshold_seconds: int = 180) -> None:
