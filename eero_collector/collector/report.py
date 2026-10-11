@@ -157,8 +157,8 @@ def device_series(db, device_id, now, days=7):
 
 STATISTICS = {
     # key: (name, unit, unit class, kind) - kind "sum" is a running total, "mean" an hourly mean/min/max.
-    "network_download": ("eero network download", "GB", "data_size", "sum"),
-    "network_upload": ("eero network upload", "GB", "data_size", "sum"),
+    "network_download": ("eero network download", "GB", "information", "sum"),
+    "network_upload": ("eero network upload", "GB", "information", "sum"),
     "speedtest_download": ("eero speed test download", "Mbit/s", "data_rate", "mean"),
     "speedtest_upload": ("eero speed test upload", "Mbit/s", "data_rate", "mean"),
 }

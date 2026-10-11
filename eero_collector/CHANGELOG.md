@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (2026-10-11)
+
+- Fixes the statistics import: Home Assistant names the unit class for data sizes `information`; 0.2.0's
+  import was refused and wrote nothing.
+
 ## 0.2.0 (2026-10-11)
 
 - Imports the collector's history into Home Assistant's long-term statistics: `eero_collector:network_download`
