@@ -41,6 +41,7 @@ the collector starts fetching them on its next daily run, with no reconfiguratio
 | `backfill`, `backfill_device_hourly` | Fetch eero's stored history (network and per-device) on first run |
 | `sample_retention_days` | Keep 5-minute client samples this long; older ones are kept as hourly summaries |
 | `timezone` | Time zone for "today" (eero's day boundaries) |
+| `import_statistics` | Import network usage and eero speed-test history into HA's long-term statistics (`eero_collector:*`), then keep it current every hour (default on) |
 
 ## Data
 

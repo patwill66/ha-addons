@@ -1,7 +1,8 @@
 """eero Collector add-on entry point.
 
 Runs ~/Projects/eero-network's scripts/run_collector.py as a child process (restarted 60 s after a crash),
-publish.py in a thread (MQTT discovery to Home Assistant) and web.py in a thread (ingress pages,
+publish.py in a thread (MQTT discovery to Home Assistant), hastats.py in a thread (long-term statistics
+import) and web.py in a thread (ingress pages,
 including the eero login). The database and lock live in /share/eero_collector/ (part of HA's full
 backups); the eero session token lives in /data/session.json, private to this add-on.
 """
@@ -17,6 +18,7 @@ import time
 
 sys.path.insert(0, "/app")
 
+import hastats  # noqa: E402
 import publish  # noqa: E402
 import web  # noqa: E402
 from collector.session import FileSessionStore  # noqa: E402
@@ -69,8 +71,10 @@ def main():
     stop = threading.Event()
     session = FileSessionStore(SESSION)
     threading.Thread(target=web.run, daemon=True, args=(str(DB), session, timezone, log)).start()
+    token = supervisor_token()
+    if options.get("import_statistics", True):
+        threading.Thread(target=hastats.Importer(token, str(DB), log).run, daemon=True, args=(stop,)).start()
     if options.get("publish_mqtt", True):
-        token = supervisor_token()
         try:
             broker = publish.broker_from_supervisor(token)
             pub = publish.Publisher(broker, str(DB), options.get("tracked_devices", []),

@@ -155,6 +155,43 @@ def device_series(db, device_id, now, days=7):
     }
 
 
+STATISTICS = {
+    # key: (name, unit, unit class, kind) - kind "sum" is a running total, "mean" an hourly mean/min/max.
+    "network_download": ("eero network download", "GB", "data_size", "sum"),
+    "network_upload": ("eero network upload", "GB", "data_size", "sum"),
+    "speedtest_download": ("eero speed test download", "Mbit/s", "data_rate", "mean"),
+    "speedtest_upload": ("eero speed test upload", "Mbit/s", "data_rate", "mean"),
+}
+
+
+def statistics(db, since=0):
+    """Hourly series for Home Assistant's long-term statistics: {key: [row, ...]} with rows whose
+    `start` (UTC hour epoch) is >= since.
+
+    - network_download/upload: eero's complete hourly counters in GB, as a running total (`sum`) from
+      the first hour with any traffic (eero answers zeros for days before its history starts, which
+      aren't real). Sums always count from that first hour, so re-sending recent rows is safe.
+    - speedtest_download/upload: eero's speed tests (gateway), mean/min/max of the tests in each hour.
+    """
+    out = {k: [] for k in STATISTICS}
+    first = db.execute("SELECT min(hour) FROM usage_network_hourly WHERE down > 0 OR up > 0").fetchone()[0]
+    if first is not None:
+        total = {"down": 0, "up": 0}
+        for r in db.execute("""SELECT hour, down, up FROM usage_network_hourly WHERE complete=1 AND hour >= ?
+                ORDER BY hour""", (first,)):
+            for d in total:
+                total[d] += r[d]
+            if r["hour"] >= since:
+                out["network_download"].append({"start": r["hour"], "sum": round(total["down"] / 1e9, 4)})
+                out["network_upload"].append({"start": r["hour"], "sum": round(total["up"] / 1e9, 4)})
+    for d, key in (("down", "speedtest_download"), ("up", "speedtest_upload")):
+        for r in db.execute(f"""SELECT ts / 3600 * 3600 AS hour, avg({d}_mbps) AS mean, min({d}_mbps) AS min,
+                max({d}_mbps) AS max FROM speedtests WHERE {d}_mbps IS NOT NULL AND ts >= ? / 3600 * 3600
+                GROUP BY 1 ORDER BY 1""", (since,)):
+            out[key].append({"start": r["hour"], "mean": round(r["mean"], 2), "min": r["min"], "max": r["max"]})
+    return out
+
+
 def find_devices(db, keys):
     """Device ids for user-given names or MACs (case-insensitive; hostnames with or without the trailing dot).
     Unknown keys are returned separately."""

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 (2026-10-11)
+
+- Imports the collector's history into Home Assistant's long-term statistics: `eero_collector:network_download`
+  and `network_upload` (hourly, from when eero's records begin) and `speedtest_download` and `speedtest_upload`
+  (eero's speed tests). Statistics cards can show months of history; the import repeats every hour.
+  Needs access to Home Assistant's API (`homeassistant_api`). Option `import_statistics` turns it off.
+
 ## 0.1.1 (2026-10-08)
 
 - `tracked_devices` entries can carry a friendly name: `desktop-1006 = Array Desktop` names the HA device.
