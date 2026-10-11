@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 (2026-10-11)
+
+- **Mesh map:** two new images on eero Network, "Mesh map" (a tree, for wide screens) and "Mesh map (phone)" (a
+  stacked list). They show the internet, the gateway and each eero under the eero it connects through (wired or
+  wireless, band, mesh bars, upstream switches in 24 h), with every band's channel, width, clients and channel
+  utilization; busy (50 %+) and congested (75 %+) channels are marked. Light or dark follows the viewer's system
+  setting. A picture is sent only when it changes.
+
 ## 0.3.0 (2026-10-11)
 
 - **Device picker:** "eero Network → Device" lists every device seen in the last 30 days (shared names get the

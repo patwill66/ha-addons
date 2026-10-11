@@ -11,6 +11,7 @@ Definitions:
 - A "new device" is one whose eero first_seen is within the window, so a fresh collector database
   doesn't report every device as new.
 - Weak signal: below WEAK_SIGNAL_DBM. Poor link: eero's score_bars <= POOR_BARS.
+- Channel utilization is busy from UTIL_BUSY % and congested from UTIL_CONGESTED %.
 """
 
 import datetime
@@ -24,6 +25,8 @@ STALE_SECONDS = 900  # a device sample older than this isn't "current"
 RECENT_TESTS = 10
 RECENT_EVENTS = 15
 CHOICE_DAYS = 30  # the device picker lists devices seen within this many days
+UTIL_BUSY = 50  # channel utilization (% of airtime in use) from which a channel reads as busy
+UTIL_CONGESTED = 75  # ... and congested: clients on it will notice
 
 
 def _one(db, sql, *args):
@@ -120,6 +123,63 @@ def nodes(db, now=None):
                      "upstream_changes_7d": upstream_changes(db, n["id"], now - 7 * 86400)}
         out.append({**n, **{k: v for k, v in s.items() if k not in ("node_id", "os_version")},
                     "online": online, "radios": radios, **extra})
+    return out
+
+
+def utilization_level(pct):
+    """'ok', 'busy' or 'congested' for a channel utilization percentage (None when unknown)."""
+    if pct is None:
+        return None
+    return "congested" if pct >= UTIL_CONGESTED else "busy" if pct >= UTIL_BUSY else "ok"
+
+
+def topology(nodes):
+    """The mesh as a tree, from nodes(): each eero with the eero it connects through.
+
+    Returns the nodes parents-first (depth-first, siblings by location) with `parent_id`, `depth` and `link`:
+    'wired' (wired backhaul; eero doesn't say through which switch, so it hangs off the gateway), 'wireless'
+    (to the eero named in `upstream`, over `link_band`) or 'unknown' (upstream not among the eeros, or a loop;
+    drawn under the gateway). The gateway is a root with link None. Each radio gets a utilization `level`.
+    """
+    by_id = {n["id"]: n for n in nodes}
+    by_location = {}
+    for n in nodes:
+        by_location.setdefault(n.get("location"), n["id"])
+    gateway = next((n["id"] for n in nodes if n.get("is_gateway")), None)
+    parent, link = {}, {}
+    for n in nodes:
+        nid = n["id"]
+        if nid == gateway:
+            parent[nid], link[nid] = None, None
+        elif n.get("connection_type") == "WIRED":
+            parent[nid], link[nid] = gateway, "wired"
+        elif by_location.get(n.get("upstream")) not in (None, nid):
+            parent[nid], link[nid] = by_location[n["upstream"]], "wireless"
+        else:
+            parent[nid], link[nid] = gateway, "unknown"
+    for nid in parent:  # a loop in eero's upstream names would hide nodes from the tree: cut it at the gateway
+        seen, p = {nid}, parent[nid]
+        while p is not None and p not in seen:
+            seen.add(p)
+            p = parent[p]
+        if p is not None:
+            parent[nid], link[nid] = gateway, "unknown"
+    children = {}
+    for nid, p in parent.items():
+        children.setdefault(p, []).append(nid)
+    out = []
+
+    def walk(nid, depth):
+        n = by_id[nid]
+        band = n.get("upstream_radio") if link[nid] == "wireless" else None
+        out.append({**n, "parent_id": parent[nid], "depth": depth, "link": link[nid],
+                    "link_band": band.replace("GHz", "").strip() if band else None,
+                    "radios": [{**r, "level": utilization_level(r.get("utilization"))} for r in n.get("radios", [])]})
+        for c in sorted(children.get(nid, []), key=lambda c: by_id[c].get("location") or ""):
+            walk(c, depth + 1)
+
+    for root in sorted(children.get(None, []), key=lambda r: (r != gateway, by_id[r].get("location") or "")):
+        walk(root, 0)
     return out
 
 

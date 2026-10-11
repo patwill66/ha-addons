@@ -21,6 +21,11 @@ every 15 seconds. Live per-device bandwidth isn't available without the eero app
 insights) show as *locked* on the status page and the `Eero Plus` sensor. If the network gets Plus,
 the collector starts fetching them on its next daily run, with no reconfiguration.
 
+**Mesh map:** the images *Mesh map* and *Mesh map (phone)* on the eero Network device draw the mesh as it
+is now: internet, the gateway, each eero under the eero it connects through (wired or wireless, band and
+mesh bars), and per band its channel, clients and channel utilization (amber from 50 %, red from 75 %).
+Show them with a Picture entity card; they refresh when new eero data arrives.
+
 ## Setup
 
 1. The **Mosquitto broker** add-on and the MQTT integration must be running. MQTT credentials come from

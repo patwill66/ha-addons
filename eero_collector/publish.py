@@ -7,6 +7,8 @@ current summaries, and publishes one retained JSON state per HA device:
   eero_collector/client/<device id> -> one device per tracked client (option tracked_devices)
   eero_collector/picker             -> the device picker (a select on "eero Network") and the chosen
                                        device's details (sensor "Selected device", attributes)
+  eero_collector/mesh_map/<layout>  -> the mesh drawn as an SVG (meshmap.py; images "Mesh map" and
+                                       "Mesh map (phone)" on "eero Network"), sent only when it changes
 Discovery configs (homeassistant/<component>/eero_collector/<object>/config, retained) are sent at
 start and again whenever Home Assistant announces itself on homeassistant/status. Configs of entities
 that disappear (a client no longer tracked) are cleared. Availability follows the MQTT last will.
@@ -22,6 +24,7 @@ import time
 import urllib.request
 from zoneinfo import ZoneInfo
 
+import meshmap
 import mqtt
 from collector import report
 
@@ -32,6 +35,7 @@ APP = pathlib.Path(__file__).resolve().parent
 KNOWN_TOPICS = pathlib.Path("/data/discovery_topics.json")
 PICKER = pathlib.Path("/data/picker.json")
 PICKER_SET = f"{BASE}/picker/set"
+MAP_LAYOUTS = (("wide", "mesh_map", "Mesh map"), ("tall", "mesh_map_phone", "Mesh map (phone)"))
 
 
 def iso(epoch):
@@ -67,6 +71,8 @@ class Builder:
             c["json_attributes_template"] = "{{ {" + ", ".join(f'"{a}": value_json.{a}' for a in attrs) + "} | tojson }}"
         if not enabled:
             c["enabled_by_default"] = False
+        if component == "image":  # an image has no state of its own, only image_topic
+            del c["state_topic"], c["value_template"]
         self.configs[f"{DISCOVERY}/{component}/{BASE}/{object_id}/config"] = c
 
 
@@ -132,6 +138,9 @@ def network_configs(version):
           attrs=["premium_locked"])
     b.add("sensor", "addon_version", "Add-on version", v("addon_version"), category="diagnostic", icon="mdi:tag",
           attrs=["collector_source"])
+    for layout, key, name in MAP_LAYOUTS:
+        b.add("image", key, name, None, icon="mdi:sitemap", image_topic=f"{BASE}/mesh_map/{layout}",
+              content_type="image/svg+xml")
     return b.configs
 
 
@@ -254,9 +263,12 @@ def collect(db_path, tracked, tz, version, source):
                                 "last_hour_mb": d["last_hour_mb"], "week_mb": d["week_mb"],
                                 **{k: d[k] for k in ("drops_24h", "roams_24h")}}
         choices = report.device_choices(db, now)
+        topo = report.topology(nodes)
+        as_of = max((n["ts"] for n in nodes if n.get("ts")), default=None)
+        maps = {layout: meshmap.render(topo, net.get("isp_up"), as_of, tz, layout) for layout, _, _ in MAP_LAYOUTS}
     finally:
         db.close()
-    return net, nodes, node_states, clients, missing, choices
+    return net, nodes, node_states, clients, missing, choices, maps
 
 
 def picker_detail(db_path, device_id, label, tz):
@@ -292,6 +304,7 @@ class Publisher:
         self.warned_missing = set()
         self.options = None
         self.picked = None  # label requested over MQTT, handled in the publishing loop
+        self.maps = {}  # mesh map SVGs last sent, so an unchanged picture isn't sent again
         try:
             self.picker = json.loads(PICKER.read_text())
         except (OSError, ValueError):
@@ -314,8 +327,8 @@ class Publisher:
         self.resend = True
 
     def publish_once(self):
-        net, nodes, node_states, clients, missing, choices = collect(self.db_path, self.tracked, self.tz, self.version,
-                                                                     self.source)
+        net, nodes, node_states, clients, missing, choices, maps = collect(self.db_path, self.tracked, self.tz,
+                                                                           self.version, self.source)
         options = [label for _, label in choices]
         ids = {label: did for did, label in choices}
         if self.picked is not None:
@@ -349,12 +362,17 @@ class Publisher:
                 self.client.publish(topic, json.dumps(config), retain=True)
             KNOWN_TOPICS.write_text(json.dumps(sorted(configs)))
             self.resend = False
+            self.maps = {}
             time.sleep(1)  # let HA create the entities before the first states arrive
         self.client.publish(f"{BASE}/network", json.dumps(net, default=str), retain=True)
         for nid, st in node_states.items():
             self.client.publish(f"{BASE}/node/{nid}", json.dumps(st), retain=True)
         for did, st in clients.items():
             self.client.publish(f"{BASE}/client/{did}", json.dumps(st), retain=True)
+        for layout, svg in maps.items():
+            if self.maps.get(layout) != svg:
+                self.client.publish(f"{BASE}/mesh_map/{layout}", svg, retain=True)
+                self.maps[layout] = svg
         if self.picker.get("id"):
             self.client.publish(f"{BASE}/picker", json.dumps({"label": self.picker["label"]}), retain=True)
             self.client.publish(f"{BASE}/picker/detail", json.dumps(
