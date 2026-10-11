@@ -21,6 +21,9 @@ from . import models
 WEAK_SIGNAL_DBM = -70
 POOR_BARS = 2
 STALE_SECONDS = 900  # a device sample older than this isn't "current"
+RECENT_TESTS = 10
+RECENT_EVENTS = 15
+CHOICE_DAYS = 30  # the device picker lists devices seen within this many days
 
 
 def _one(db, sql, *args):
@@ -52,6 +55,8 @@ def network(db, now, tz, db_path=None):
     latest_ts = _one(db, "SELECT max(ts) AS ts FROM device_samples").get("ts")
     current = _all(db, """SELECT d.*, s.signal, s.score_bars FROM device_samples s JOIN devices d ON d.id = s.device_id
         WHERE s.ts = ?""", latest_ts) if latest_ts else []
+    bands = {r["band"]: r["n"] for r in _all(db, """SELECT band, count(*) AS n FROM device_samples
+        WHERE ts = ? AND band IS NOT NULL GROUP BY band""", latest_ts)} if latest_ts else {}
     weak = sorted((d for d in current if d["signal"] is not None and d["signal"] < WEAK_SIGNAL_DBM), key=lambda d: d["signal"])
     poor = [d for d in current if d["score_bars"] is not None and d["score_bars"] <= POOR_BARS]
     new = [d for d in _all(db, "SELECT * FROM devices WHERE eero_first_seen IS NOT NULL")
@@ -77,6 +82,11 @@ def network(db, now, tz, db_path=None):
         "last_hour_down_mbps": _rate(last_hour.get("down"), hour_s), "last_hour_up_mbps": _rate(last_hour.get("up"), hour_s),
         "today_down_gb": _gb(today.get("down")), "today_up_gb": _gb(today.get("up")),
         "speedtest_at": speed.get("ts"), "speedtest_down_mbps": speed.get("down_mbps"), "speedtest_up_mbps": speed.get("up_mbps"),
+        "speedtests": _all(db, "SELECT ts, down_mbps, up_mbps FROM speedtests ORDER BY ts DESC LIMIT ?", RECENT_TESTS),
+        "clients_2_4": bands.get("2.4", 0) if current else None, "clients_5": bands.get("5", 0) if current else None,
+        "clients_6": bands.get("6", 0) if current else None,
+        "network_events": _all(db, """SELECT ts_ms / 1000 AS ts, description AS text FROM events WHERE category = 'Network'
+            ORDER BY ts_ms DESC LIMIT ?""", RECENT_EVENTS),
         "weak_signal_count": len(weak) if current else None,
         "weak_signal": [f"{device_name(d)} ({d['signal']} dBm)" for d in weak[:20]],
         "poor_link_count": len(poor) if current else None,
@@ -90,15 +100,26 @@ def network(db, now, tz, db_path=None):
     }
 
 
-def nodes(db):
+def upstream_changes(db, node_id, since):
+    """How often a node's upstream (the eero it connects through, or wired) changed since `since`."""
+    return db.execute("""SELECT count(*) FROM (SELECT upstream, lag(upstream) OVER (ORDER BY ts) AS prev, ts,
+        lag(ts) OVER (ORDER BY ts) AS prev_ts FROM node_samples WHERE node_id = ?)
+        WHERE prev_ts IS NOT NULL AND ts >= ? AND upstream IS NOT prev""", (node_id, since)).fetchone()[0]
+
+
+def nodes(db, now=None):
     out = []
     for n in _all(db, "SELECT * FROM nodes ORDER BY is_gateway DESC, location"):
         s = _one(db, "SELECT * FROM node_samples WHERE node_id=? ORDER BY ts DESC LIMIT 1", n["id"])
         ts = s.get("ts")
         radios = _all(db, "SELECT * FROM radio_samples WHERE node_id=? AND ts=? ORDER BY band", n["id"], ts) if ts else []
         online = s.get("status") == "green" and s.get("heartbeat_ok") == 1 if s else None
+        extra = {}
+        if now is not None:
+            extra = {"upstream_changes_24h": upstream_changes(db, n["id"], now - 86400),
+                     "upstream_changes_7d": upstream_changes(db, n["id"], now - 7 * 86400)}
         out.append({**n, **{k: v for k, v in s.items() if k not in ("node_id", "os_version")},
-                    "online": online, "radios": radios})
+                    "online": online, "radios": radios, **extra})
     return out
 
 
@@ -115,9 +136,59 @@ def device_now(db, device_id, now, tz):
                  device_id, midnight)
     last = _one(db, """SELECT u.* FROM usage_device_hourly u JOIN usage_network_hourly n ON n.hour = u.hour
         WHERE u.device_id=? AND n.complete=1 ORDER BY u.hour DESC LIMIT 1""", device_id)
+    week = _one(db, "SELECT sum(down + up) AS b FROM usage_device_hourly WHERE device_id=? AND hour >= ?",
+                device_id, now - 7 * 86400)
+    counts = {f"{k}_{w}": db.execute("SELECT count(*) FROM device_changes WHERE device_id=? AND kind=? AND ts >= ?",
+                                     (device_id, kind, now - secs)).fetchone()[0]
+              for k, kind in (("drops", "disconnected"), ("roams", "node"))
+              for w, secs in (("24h", 86400), ("7d", 7 * 86400))}
     return {**d, "name": device_name(d), "node": node.get("location"), "sample": s,
             "today_mb": _mb((today.get("down") or 0) + (today.get("up") or 0)) if today.get("down") is not None else 0.0,
-            "last_hour_mb": _mb((last.get("down") or 0) + (last.get("up") or 0)) if last else 0.0}
+            "last_hour_mb": _mb((last.get("down") or 0) + (last.get("up") or 0)) if last else 0.0,
+            "week_mb": _mb(week.get("b") or 0), **counts}
+
+
+def device_choices(db, now):
+    """[(device id, label)] for a device picker: devices seen within CHOICE_DAYS, connected first, then by
+    name. Labels are unique: a shared name gets the manufacturer (or type) and the end of the MAC."""
+    rows = _all(db, """SELECT * FROM devices WHERE connected = 1 OR last_connected_at >= ? OR first_seen_at >= ?
+        ORDER BY connected DESC, lower(coalesce(nullif(nickname, ''), nullif(display_name, ''), hostname, mac))""",
+                now - CHOICE_DAYS * 86400, now - CHOICE_DAYS * 86400)
+    names = [device_name(r) for r in rows]
+    seen = {}
+    for n in names:
+        seen[n] = seen.get(n, 0) + 1
+    out = []
+    for r, n in zip(rows, names):
+        label = n
+        if seen[n] > 1:
+            who = (r.get("manufacturer") or r.get("device_type") or "").strip()
+            label = f"{n} ({who + ', ' if who else ''}…{(r.get('mac') or '')[-5:]})"
+        out.append((r["id"], label))
+    return out
+
+
+def device_detail(db, device_id, now, tz):
+    """device_now() plus what a one-device panel shows: the last 24 h of link samples summarized, daily
+    usage for the last 14 days and the latest changes (node ids translated to eero locations)."""
+    d = device_now(db, device_id, now, tz)
+    if not d:
+        return None
+    loc = {str(r["id"]): r["location"] for r in _all(db, "SELECT id, location FROM nodes")}
+    link = _one(db, """SELECT count(*) AS samples, round(avg(signal)) AS signal_avg, min(signal) AS signal_min,
+        max(signal) AS signal_max, round(avg(tx_retry_pct), 1) AS retry_avg, round(avg(rx_rate_mbps)) AS rate_avg,
+        group_concat(DISTINCT band) AS bands FROM device_samples WHERE device_id=? AND ts >= ?""", device_id, now - 86400)
+    nodes_used = [loc.get(str(r["node_id"]), str(r["node_id"])) for r in
+                  _all(db, "SELECT DISTINCT node_id FROM device_samples WHERE device_id=? AND ts >= ? AND node_id IS NOT NULL",
+                       device_id, now - 86400)]
+    daily = [{"day": r["day"], "down_mb": _mb(r["down"]), "up_mb": _mb(r["up"])} for r in
+             _all(db, "SELECT day, down, up FROM usage_device_daily WHERE device_id=? ORDER BY day DESC LIMIT 14", device_id)]
+    changes = []
+    for c in _all(db, "SELECT ts, kind, old, new FROM device_changes WHERE device_id=? ORDER BY ts DESC LIMIT 20", device_id):
+        if c["kind"] == "node":
+            c["old"], c["new"] = loc.get(c["old"], c["old"]), loc.get(c["new"], c["new"])
+        changes.append(c)
+    return {**d, "link_24h": {**link, "nodes": nodes_used}, "daily": daily, "changes": changes}
 
 
 def device_table(db, now, tz):

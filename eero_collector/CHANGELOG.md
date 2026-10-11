@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 (2026-10-11)
+
+- **Device picker:** "eero Network → Device" lists every device seen in the last 30 days (shared names get the
+  manufacturer and the end of the MAC). "Selected device" carries the chosen device's details as attributes:
+  connection, signal, link rate, retries, data used, disconnects and roams, a 24-hour link summary, daily usage for
+  14 days and its latest changes. The picker only changes what the add-on shows; nothing is sent to eero.
+- Tracked clients add: data in the last 7 days, Wi-Fi retries, disconnects and roams in the last 24 hours.
+- Each eero adds "Upstream switches" (24 h and 7 days): how often it changed the eero it connects through.
+- eero Network adds clients per band (all eeros), "Last network event" (eero's own feed: channel changes and
+  more; the latest 15 in its attributes) and the last 10 speed tests (attributes of "Last speed test").
+
 ## 0.2.1 (2026-10-11)
 
 - Fixes the statistics import: Home Assistant names the unit class for data sizes `information`; 0.2.0's

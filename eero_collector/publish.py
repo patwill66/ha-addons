@@ -5,10 +5,13 @@ current summaries, and publishes one retained JSON state per HA device:
   eero_collector/network            -> device "eero Network"
   eero_collector/node/<node id>     -> one device per eero node
   eero_collector/client/<device id> -> one device per tracked client (option tracked_devices)
+  eero_collector/picker             -> the device picker (a select on "eero Network") and the chosen
+                                       device's details (sensor "Selected device", attributes)
 Discovery configs (homeassistant/<component>/eero_collector/<object>/config, retained) are sent at
 start and again whenever Home Assistant announces itself on homeassistant/status. Configs of entities
 that disappear (a client no longer tracked) are cleared. Availability follows the MQTT last will.
-Nothing here talks to eero.
+The picker only chooses what this add-on shows; the choice is kept in /data/picker.json. Nothing here
+talks to eero.
 """
 
 import datetime
@@ -27,6 +30,8 @@ DISCOVERY = "homeassistant"
 AVAIL = f"{BASE}/status"
 APP = pathlib.Path(__file__).resolve().parent
 KNOWN_TOPICS = pathlib.Path("/data/discovery_topics.json")
+PICKER = pathlib.Path("/data/picker.json")
+PICKER_SET = f"{BASE}/picker/set"
 
 
 def iso(epoch):
@@ -45,17 +50,19 @@ class Builder:
         self.configs = {}
 
     def add(self, component, key, name, value, unit=None, device_class=None, state_class=None, icon=None,
-            category=None, attrs=None, enabled=True, payload_on=None):
+            category=None, attrs=None, enabled=True, payload_on=None, state_topic=None, attrs_topic=None, **extra):
         object_id = f"{self.prefix}_{key}"
-        c = {"name": name, "unique_id": object_id, "object_id": object_id, "state_topic": self.state_topic,
-             "value_template": value, "availability_topic": AVAIL, "device": self.device}
+        c = {"name": name, "unique_id": object_id, "object_id": object_id, "state_topic": state_topic or self.state_topic,
+             "value_template": value, "availability_topic": AVAIL, "device": self.device, **extra}
         for k, v in (("unit_of_measurement", unit), ("device_class", device_class), ("state_class", state_class),
                      ("icon", icon), ("entity_category", category)):
             if v:
                 c[k] = v
         if component == "binary_sensor":
             c["payload_on"], c["payload_off"] = payload_on or "ON", "OFF"
-        if attrs:
+        if attrs_topic:
+            c["json_attributes_topic"] = attrs_topic
+        elif attrs:
             c["json_attributes_topic"] = self.state_topic
             c["json_attributes_template"] = "{{ {" + ", ".join(f'"{a}": value_json.{a}' for a in attrs) + "} | tojson }}"
         if not enabled:
@@ -96,7 +103,13 @@ def network_configs(version):
               device_class="data_size", state_class="total_increasing")
         b.add("sensor", f"speedtest_{d}", f"Speed test {word.lower()}", v(f"speedtest_{d}_mbps"), unit="Mbit/s",
               device_class="data_rate", state_class="measurement")
-    b.add("sensor", "speedtest_at", "Last speed test", v("speedtest_at_iso"), device_class="timestamp")
+    b.add("sensor", "speedtest_at", "Last speed test", v("speedtest_at_iso"), device_class="timestamp",
+          attrs=["speedtests"])
+    for s, label in (("2_4", "2.4 GHz"), ("5", "5 GHz"), ("6", "6 GHz")):
+        b.add("sensor", f"clients_{s}", f"{label} clients", v(f"clients_{s}"), unit="clients",
+              state_class="measurement", icon="mdi:wifi")
+    b.add("sensor", "network_event", "Last network event", "{{ value_json.network_event_text }}",
+          icon="mdi:format-list-bulleted", attrs=["network_events"])
     b.add("sensor", "weak_signal", "Weak-signal devices", v("weak_signal_count"), unit="devices",
           state_class="measurement", icon="mdi:wifi-strength-1-alert", attrs=["weak_signal"])
     b.add("sensor", "poor_link", "Poor-link devices", v("poor_link_count"), unit="devices",
@@ -122,6 +135,16 @@ def network_configs(version):
     return b.configs
 
 
+def picker_configs(version, options):
+    """The device picker: a select listing every recent device, and the chosen device's details."""
+    b = Builder(network_device(version), f"{BASE}/picker", "eero_network")
+    b.add("select", "device_picker", "Device", "{{ value_json.label }}", icon="mdi:devices",
+          command_topic=PICKER_SET, options=options)
+    b.add("sensor", "selected_device", "Selected device", "{{ value_json.label }}", icon="mdi:devices",
+          attrs_topic=f"{BASE}/picker/detail")
+    return b.configs
+
+
 def node_configs(node, version):
     nid = node["id"]
     dev = {"identifiers": [f"{BASE}_node_{nid}"], "name": f"eero {node['location']}", "manufacturer": "eero",
@@ -136,6 +159,9 @@ def node_configs(node, version):
     b.add("sensor", "cloud_since", "Connected to eero cloud since", v("cloud_since_iso"), device_class="timestamp",
           category="diagnostic")
     b.add("sensor", "upstream", "Upstream", v("upstream_text"), icon="mdi:transit-connection-variant")
+    for w, label in (("24h", "24 h"), ("7d", "7 days")):
+        b.add("sensor", f"upstream_changes_{w}", f"Upstream switches ({label})", v(f"upstream_changes_{w}"),
+              unit="switches", state_class="measurement", icon="mdi:swap-horizontal")
     b.add("sensor", "firmware", "Firmware", v("os_version"), category="diagnostic", icon="mdi:chip")
     b.add("binary_sensor", "update", "Firmware update available", on_off("update_available"), device_class="update",
           category="diagnostic")
@@ -167,7 +193,13 @@ def client_configs(d, version):
     b.add("sensor", "last_hour", "Data, last hour", v("last_hour_mb"), unit="MB", device_class="data_size",
           state_class="measurement")
     b.add("sensor", "link_rate", "Wi-Fi link rate", v("rx_rate_mbps"), unit="Mbit/s", device_class="data_rate",
-          state_class="measurement", category="diagnostic")
+          state_class="measurement")
+    b.add("sensor", "week", "Data, last 7 days", v("week_mb"), unit="MB", device_class="data_size",
+          state_class="measurement")
+    b.add("sensor", "retries", "Wi-Fi retries", v("tx_retry_pct"), unit="%", state_class="measurement",
+          icon="mdi:repeat")
+    for k, label, icon in (("drops", "Disconnects", "mdi:lan-disconnect"), ("roams", "Roams", "mdi:swap-horizontal")):
+        b.add("sensor", f"{k}_24h", f"{label} (24 h)", v(f"{k}_24h"), unit=k, state_class="measurement", icon=icon)
     return b.configs
 
 
@@ -186,11 +218,15 @@ def collect(db_path, tracked, tz, version, source):
         net = report.network(db, now, tz, db_path)
         net.update(sample_at_iso=iso(net["sample_at"]), speedtest_at_iso=iso(net["speedtest_at"]),
                    last_hour_start_iso=iso(net["last_hour_start"]), addon_version=version, collector_source=source)
-        nodes = report.nodes(db)
+        net["speedtests"] = [{"at": iso(s["ts"]), "down": s["down_mbps"], "up": s["up_mbps"]} for s in net["speedtests"]]
+        net["network_events"] = [{"at": iso(e["ts"]), "text": e["text"]} for e in net["network_events"]]
+        net["network_event_text"] = (net["network_events"][0]["text"][:250] if net["network_events"] else None)
+        nodes = report.nodes(db, now)
         node_states = {}
         for n in nodes:
             st = {k: n.get(k) for k in ("online", "mesh_bars", "clients", "clients_wired", "clients_wireless",
-                                        "os_version", "update_available", "location")}
+                                        "os_version", "update_available", "location", "upstream_changes_24h",
+                                        "upstream_changes_7d")}
             st["last_reboot_iso"] = iso(n.get("last_reboot_at"))
             st["cloud_since_iso"] = iso(n["ts"] - n["cloud_uptime_s"]) if n.get("ts") and n.get("cloud_uptime_s") else None
             st["upstream_text"] = "wired" if n.get("connection_type") == "WIRED" else \
@@ -214,10 +250,37 @@ def collect(db_path, tracked, tz, version, source):
                                 "device_type": d.get("device_type"), "connected": bool(d.get("connected")),
                                 "node": d.get("node"), "band": d.get("band"), "signal": s.get("signal"),
                                 "score_bars": s.get("score_bars"), "rx_rate_mbps": s.get("rx_rate_mbps"),
-                                "today_mb": d["today_mb"], "last_hour_mb": d["last_hour_mb"]}
+                                "tx_retry_pct": s.get("tx_retry_pct"), "today_mb": d["today_mb"],
+                                "last_hour_mb": d["last_hour_mb"], "week_mb": d["week_mb"],
+                                **{k: d[k] for k in ("drops_24h", "roams_24h")}}
+        choices = report.device_choices(db, now)
     finally:
         db.close()
-    return net, nodes, node_states, clients, missing
+    return net, nodes, node_states, clients, missing, choices
+
+
+def picker_detail(db_path, device_id, label, tz):
+    """The chosen device's details as attributes for the "Selected device" sensor."""
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        d = report.device_detail(db, device_id, int(time.time()), tz)
+    finally:
+        db.close()
+    if not d:
+        return {"label": label}
+    s = d["sample"] or {}
+    return {"label": label, "name": d["name"], "connected": bool(d.get("connected")), "node": d.get("node"),
+            "band": d.get("band"), "channel": d.get("channel"), "connection_type": d.get("connection_type"),
+            "manufacturer": d.get("manufacturer"), "device_type": d.get("device_type"), "ip": d.get("ip"),
+            "mac": d.get("mac"), "private_mac": bool(d.get("is_private")),
+            "signal": s.get("signal"), "snr": s.get("snr"), "score_bars": s.get("score_bars"),
+            "rx_rate_mbps": s.get("rx_rate_mbps"), "tx_rate_mbps": s.get("tx_rate_mbps"), "tx_retry_pct": s.get("tx_retry_pct"),
+            "today_mb": d["today_mb"], "last_hour_mb": d["last_hour_mb"], "week_mb": d["week_mb"],
+            **{k: d[k] for k in ("drops_24h", "roams_24h", "drops_7d", "roams_7d")},
+            "first_seen": d.get("eero_first_seen"), "last_connected": iso(d.get("last_connected_at")),
+            "link_24h": d["link_24h"], "daily": d["daily"],
+            "changes": [{"at": iso(c["ts"]), **{k: c[k] for k in ("kind", "old", "new")}} for c in d["changes"]]}
 
 
 class Publisher:
@@ -227,10 +290,18 @@ class Publisher:
         self.client = None
         self.resend = True
         self.warned_missing = set()
+        self.options = None
+        self.picked = None  # label requested over MQTT, handled in the publishing loop
+        try:
+            self.picker = json.loads(PICKER.read_text())
+        except (OSError, ValueError):
+            self.picker = {}
 
     def on_message(self, topic, payload):
         if topic == f"{DISCOVERY}/status" and payload == b"online":
             self.resend = True  # Home Assistant restarted: send discovery again
+        elif topic == PICKER_SET:
+            self.picked = payload.decode(errors="replace")
 
     def connect(self):
         self.client = mqtt.Client(self.broker["host"], int(self.broker["port"]), self.broker.get("username"),
@@ -238,11 +309,28 @@ class Publisher:
                                   will_payload="offline", keepalive=120, on_message=self.on_message)
         self.client.connect()
         self.client.subscribe(f"{DISCOVERY}/status")
+        self.client.subscribe(PICKER_SET)
         self.client.publish(AVAIL, "online", retain=True)
         self.resend = True
 
     def publish_once(self):
-        net, nodes, node_states, clients, missing = collect(self.db_path, self.tracked, self.tz, self.version, self.source)
+        net, nodes, node_states, clients, missing, choices = collect(self.db_path, self.tracked, self.tz, self.version,
+                                                                     self.source)
+        options = [label for _, label in choices]
+        ids = {label: did for did, label in choices}
+        if self.picked is not None:
+            if self.picked in ids:
+                self.picker = {"id": ids[self.picked], "label": self.picked}
+                PICKER.write_text(json.dumps(self.picker))
+            self.picked = None
+        # Labels can change (a device renamed, a name becoming shared): follow the device id.
+        if self.picker.get("id") in ids.values() and self.picker.get("label") not in ids:
+            self.picker["label"] = next(label for label, did in ids.items() if did == self.picker["id"])
+        if self.picker.get("label") not in ids and options:
+            first = next((did for did in clients if did in ids.values()), ids[options[0]])
+            self.picker = {"id": first, "label": next(label for label, did in ids.items() if did == first)}
+        if options != self.options:
+            self.resend = True
         for key in set(missing) - self.warned_missing:
             self.log(f"tracked device not found: {key!r} (use its eero name or MAC)")
         self.warned_missing = set(missing)
@@ -252,6 +340,8 @@ class Publisher:
                 configs.update(node_configs(n, self.version))
             for did, c in clients.items():
                 configs.update(client_configs({"id": did, **c}, self.version))
+            configs.update(picker_configs(self.version, options))
+            self.options = options
             previous = set(json.loads(KNOWN_TOPICS.read_text())) if KNOWN_TOPICS.exists() else set()
             for topic in previous - set(configs):
                 self.client.publish(topic, "", retain=True)  # removes the entity from HA
@@ -265,6 +355,10 @@ class Publisher:
             self.client.publish(f"{BASE}/node/{nid}", json.dumps(st), retain=True)
         for did, st in clients.items():
             self.client.publish(f"{BASE}/client/{did}", json.dumps(st), retain=True)
+        if self.picker.get("id"):
+            self.client.publish(f"{BASE}/picker", json.dumps({"label": self.picker["label"]}), retain=True)
+            self.client.publish(f"{BASE}/picker/detail", json.dumps(
+                picker_detail(self.db_path, self.picker["id"], self.picker["label"], self.tz), default=str), retain=True)
 
     def run(self, stop):
         failing = None
@@ -279,7 +373,7 @@ class Publisher:
                     self.log("publishing to Home Assistant again")
                 failing = False
                 for _ in range(self.interval):
-                    if stop.wait(1) or self.resend:
+                    if stop.wait(1) or self.resend or self.picked is not None:
                         break
                     self.client.ping_if_idle()
             except Exception as e:  # never let publishing affect collection
