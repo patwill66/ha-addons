@@ -260,6 +260,8 @@ def state(db_path, node, scenarios, tz, now, message=None):
             by = "historical baseline (not a controlled trial)" if sel["kind"] == "baseline" else "frozen when the test ended"
             selected = _flat(sel["summary"] or {}, sel["kind"], BASELINE_VIEW if sel["kind"] == "baseline"
                              else session_label(sel, tz), sel["code"], sel["name"], by)
+        if selected.get("last_upstream_change") is None:  # useful before any test, too
+            selected["last_upstream_change"] = iso(meshtest.last_upstream_change(db, node, now))
         if sel is not None:
             selected["notes"] = sel.get("notes")
             selected["throughput"] = [{"at": iso(t["ts"]), "down": t["down_mbps"], "up": t["up_mbps"]}

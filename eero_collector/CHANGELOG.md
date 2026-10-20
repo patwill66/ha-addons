@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2 (2026-10-20)
+
+- Mesh Test: "Last upstream change" also shows when no test is selected (it's the tested eero's latest change).
+
 ## 0.5.1 (2026-10-20)
 
 - Fixes the Ping import failing at start ("WebSocket closed by Home Assistant"): the WebSocket client could drop
