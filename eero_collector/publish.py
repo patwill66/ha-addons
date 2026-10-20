@@ -4,7 +4,8 @@ Every `interval` seconds it reads the database read-only, asks eero-network's co
 current summaries, and publishes one retained JSON state per HA device:
   eero_collector/network            -> device "eero Network"
   eero_collector/node/<node id>     -> one device per eero node
-  eero_collector/client/<device id> -> one device per tracked client (option tracked_devices)
+  eero_collector/client/<device id> -> one device per tracked client (option tracked_devices), including its
+                                       recent connection events (report.device_timeline) as attributes
   eero_collector/picker             -> the device picker (a select on "eero Network") and the chosen
                                        device's details (sensor "Selected device", attributes)
   eero_collector/mesh_map/<layout>  -> the mesh drawn as an SVG (meshmap.py; images "Mesh map" and
@@ -217,6 +218,7 @@ def client_configs(d, version):
           icon="mdi:repeat")
     for k, label, icon in (("drops", "Disconnects", "mdi:lan-disconnect"), ("roams", "Roams", "mdi:swap-horizontal")):
         b.add("sensor", f"{k}_24h", f"{label} (24 h)", v(f"{k}_24h"), unit=k, state_class="measurement", icon=icon)
+    b.add("sensor", "last_event", "Last connection event", v("last_event"), icon="mdi:history", attrs=["events"])
     return b.configs
 
 
@@ -271,6 +273,10 @@ def collect(db_path, tracked, tz, version, source):
                                 "tx_retry_pct": s.get("tx_retry_pct"), "today_mb": d["today_mb"],
                                 "last_hour_mb": d["last_hour_mb"], "week_mb": d["week_mb"],
                                 **{k: d[k] for k in ("drops_24h", "roams_24h")}}
+                timeline = report.device_timeline(db, did, now)
+                clients[did]["events"] = [{"at": iso(e["ts"]), "text": e["text"], "source": e["source"]}
+                                          for e in timeline]
+                clients[did]["last_event"] = timeline[0]["text"][:250] if timeline else None
         choices = report.device_choices(db, now)
         topo = report.topology(nodes)
         as_of = max((n["ts"] for n in nodes if n.get("ts")), default=None)

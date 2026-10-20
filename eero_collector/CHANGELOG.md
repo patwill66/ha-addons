@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.3 (2026-10-20)
+
+- Tracked devices add "Last connection event", with the device's recent events (7 days, newest first) as
+  attributes: connects (with eero, band and channel) and disconnects from eero's feed, roams between eeros, band, IP
+  and channel changes from the polls. A connect or disconnect the feed already reported isn't listed twice.
+
 ## 0.5.2 (2026-10-20)
 
 - Mesh Test: "Last upstream change" also shows when no test is selected (it's the tested eero's latest change).

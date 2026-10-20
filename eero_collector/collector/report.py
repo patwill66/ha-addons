@@ -259,6 +259,55 @@ def device_detail(db, device_id, now, tz):
     return {**d, "link_24h": {**link, "nodes": nodes_used}, "daily": daily, "changes": changes}
 
 
+def device_timeline(db, device_id, now, days=7, limit=40):
+    """A device's recent connection events, newest first: [{ts, text, source}].
+
+    Sources: eero's event feed ("eero": exact times; connects with the eero, band and channel, and disconnects),
+    the 5-minute polls ("poll": roams between eeros, band and IP changes, and connects, disconnects or roams the
+    feed didn't already report within 10 minutes) and channel changes on the same band seen between consecutive samples
+    ("sample"; client samples are kept sample_retention_days)."""
+    since = now - days * 86400
+    loc = {str(r["id"]): r["location"] for r in _all(db, "SELECT id, location FROM nodes")}
+    out, feed, joined = [], {"connected": [], "disconnected": []}, []
+    for e in _all(db, """SELECT ts_ms / 1000 AS ts, action, node_location, band, channel FROM events
+            WHERE ts_ms >= ? AND device_id = ? AND action IN ('connected', 'disconnected') ORDER BY ts_ms""",
+                  since * 1000, device_id):
+        feed[e["action"]].append(e["ts"])
+        if e["action"] == "connected":
+            joined.append((e["ts"], e["node_location"]))
+            text = f"Connected to {e['node_location'] or 'an eero'}"
+            if e["band"]:
+                text += f" · {e['band']} GHz" + (f" ch {e['channel']}" if e["channel"] else "")
+        else:
+            text = f"Disconnected from {e['node_location'] or 'its eero'}"
+        out.append({"ts": e["ts"], "text": text, "source": "eero"})
+    for c in _all(db, """SELECT ts, kind, old, new FROM device_changes WHERE device_id = ? AND ts >= ? AND source = 'poll'
+            AND kind IN ('node', 'band', 'ip', 'connected', 'disconnected') ORDER BY ts""", device_id, since):
+        if c["kind"] == "node":
+            new = loc.get(c["new"], c["new"])
+            if any(abs(t - c["ts"]) <= 600 and where == new for t, where in joined):
+                continue  # the feed's "Connected to <new eero>" already shows this roam
+            text = f"Roamed {loc.get(c['old'], c['old'])} → {new}"
+        elif c["kind"] == "band":
+            text = f"Band {c['old']} → {c['new']} GHz"
+        elif c["kind"] == "ip":
+            text = f"IP address {c['old']} → {c['new']}"
+        elif any(abs(t - c["ts"]) <= 600 for t in feed[c["kind"]]):
+            continue  # eero's feed already has it, with the exact time
+        else:
+            text = "Connected" if c["kind"] == "connected" else "Disconnected"
+        out.append({"ts": c["ts"], "text": text, "source": "poll"})
+    prev = None
+    for s in _all(db, "SELECT ts, band, channel FROM device_samples WHERE device_id = ? AND ts >= ? ORDER BY ts",
+                  device_id, since):
+        if (prev and s["ts"] - prev["ts"] <= 450 and s["band"] == prev["band"] and s["channel"] is not None
+                and prev["channel"] is not None and s["channel"] != prev["channel"]):
+            out.append({"ts": s["ts"], "text": f"Channel {prev['channel']} → {s['channel']} ({s['band']} GHz)",
+                        "source": "sample"})
+        prev = s
+    return sorted(out, key=lambda e: e["ts"], reverse=True)[:limit]
+
+
 def device_table(db, now, tz):
     """Every known device with its current state and usage, for the inventory page."""
     midnight = local_midnight(now, tz)
