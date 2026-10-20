@@ -503,21 +503,26 @@ def ingest_ping(db, target, metric, rows, now, retention_days=35):
 
 
 def rollup(db, target, metric, lo, hi):
-    """(Re)computes ping_5min for buckets in [lo, hi)."""
+    """(Re)computes ping_5min for buckets in [lo, hi), in one pass over the readings."""
     rows = readings(db, target, metric, lo, hi)
-    out = []
-    for bucket in range(lo, hi, POLL):
-        b_end = bucket + POLL
-        if metric == "rtt":
-            v = [x for t, x in rows if bucket <= t < b_end and x is not None]
-            if v:
-                out.append((target, metric, bucket, len(v), statistics.fmean(v), statistics.median(v), max(v)))
-        else:
-            st = [(a, b, x) for a, b, x in steps(rows, bucket, b_end) if x is not None]
-            span = sum(b - a for a, b, _ in st)
-            if span:
-                n = sum(1 for t, _ in rows if bucket <= t < b_end)
-                mean = sum((b - a) * x for a, b, x in st) / span
-                out.append((target, metric, bucket, n, mean, None, max(x for _, _, x in st)))
+    if metric == "rtt":
+        by = defaultdict(list)
+        for t, x in rows:
+            if lo <= t < hi and x is not None:
+                by[t // POLL * POLL].append(x)
+        out = [(target, metric, b, len(v), statistics.fmean(v), statistics.median(v), max(v)) for b, v in sorted(by.items())]
+    else:
+        counts = Counter(t // POLL * POLL for t, _ in rows if lo <= t < hi)
+        acc = defaultdict(lambda: [0, 0.0, None])  # seconds known, value x seconds, max
+        for a, b, x in steps(rows, lo, hi):
+            while x is not None and a < b:
+                bucket = a // POLL * POLL
+                end = min(b, bucket + POLL)
+                cell = acc[bucket]
+                cell[0] += end - a
+                cell[1] += (end - a) * x
+                cell[2] = x if cell[2] is None else max(cell[2], x)
+                a = end
+        out = [(target, metric, b, counts.get(b, 0), w / span, None, mx) for b, (span, w, mx) in sorted(acc.items()) if span]
     with db:
         db.executemany("INSERT OR REPLACE INTO ping_5min VALUES(?, ?, ?, ?, ?, ?, ?)", out)

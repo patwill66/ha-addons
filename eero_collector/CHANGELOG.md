@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1 (2026-10-20)
+
+- Fixes the Ping import failing at start ("WebSocket closed by Home Assistant"): the WebSocket client could drop
+  Home Assistant's first message when it arrived together with the handshake, then wait until the Supervisor gave
+  up. The statistics import used the same client and could hit this too.
+- The Ping import fetches first and writes afterwards, so a slow database write can't stall the connection;
+  5-minute aggregates are computed in one pass.
+
 ## 0.5.0 (2026-10-20)
 
 - **Upstream, split in two:** each satellite eero adds "Upstream eero" (the eero it connects through) and "Primary

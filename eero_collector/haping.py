@@ -88,21 +88,25 @@ class Ingester:
         rows = 0
         try:
             entity_map = targets(meshtest.satellites(db))
+            fetched = []
+            # Fetch everything, close, then write: the Supervisor's proxy drops a connection that stops answering
+            # its pings, which a slow database write on the Green could cause.
             ws = self.connect(self.token)
             try:
                 t = start
                 while t < now:
                     end = min(t + CHUNK, now)
-                    result = ws.call({"type": "history/history_during_period",
-                                      "start_time": hastats.iso(t), "end_time": hastats.iso(end),
-                                      "entity_ids": [e for ms in entity_map.values() for e in ms.values()],
-                                      "include_start_time_state": True, "significant_changes_only": False,
-                                      "minimal_response": True, "no_attributes": True})
-                    for (target, metric), readings in parse(result, entity_map).items():
-                        rows += meshtest.ingest_ping(db, target, metric, readings, now, self.retention_days)
+                    fetched.append(ws.call({"type": "history/history_during_period",
+                                            "start_time": hastats.iso(t), "end_time": hastats.iso(end),
+                                            "entity_ids": [e for ms in entity_map.values() for e in ms.values()],
+                                            "include_start_time_state": True, "significant_changes_only": False,
+                                            "minimal_response": True, "no_attributes": True}))
                     t = end
             finally:
                 ws.close()
+            for result in fetched:
+                for (target, metric), readings in parse(result, entity_map).items():
+                    rows += meshtest.ingest_ping(db, target, metric, readings, now, self.retention_days)
             self.state.write_text(json.dumps({"through": now}))
             if self.baseline and self.node:
                 meshtest.ensure_baseline(db, self.node, self.baseline[0], self.baseline[1], now, self.tz)

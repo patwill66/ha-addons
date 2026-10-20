@@ -82,8 +82,8 @@ class HAWebSocket:
             self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
             head = b""
-            while b"\r\n\r\n" not in head:
-                chunk = self.sock.recv(1024)
+            while not head.endswith(b"\r\n\r\n"):  # byte by byte: the first frame can follow in the same packet
+                chunk = self.sock.recv(1)
                 if not chunk:
                     raise ConnectionError("no WebSocket handshake")
                 head += chunk
