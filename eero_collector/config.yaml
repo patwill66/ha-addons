@@ -1,6 +1,6 @@
 name: "eero Collector"
 description: "Read-only history of an eero mesh network (clients, Wi-Fi quality, usage, mesh health) in SQLite, published to Home Assistant over MQTT."
-version: "0.4.0"
+version: "0.5.0"
 slug: "eero_collector"
 arch:
   - aarch64
@@ -12,7 +12,7 @@ boot: auto
 services:
   - mqtt:need
 hassio_api: true
-# Long-term statistics import over HA Core's WebSocket API (hastats.py).
+# Long-term statistics import and Ping history for mesh tests over HA Core's WebSocket API (hastats.py, haping.py).
 homeassistant_api: true
 # Status, eero login, device inventory and snapshots (web.py).
 ingress: true
@@ -32,6 +32,16 @@ options:
   timezone: "America/Chicago"
   publish_mqtt: true
   import_statistics: true
+  import_ping: true
+  mesh_test_node: "Living Room"
+  mesh_test_scenarios:
+    - "A: Original placement, cabinet closed"
+    - "B: Same placement, cabinet door open"
+    - "C: eero outside the cabinet"
+    - "D: Back to the original placement"
+    - "E: Basement eero isolated (optional, disrupts its clients)"
+  baseline_start: ""
+  baseline_end: ""
   verbose: false
 schema:
   poll_seconds: int(120,900)
@@ -44,4 +54,10 @@ schema:
   timezone: str
   publish_mqtt: bool
   import_statistics: bool
+  import_ping: bool
+  mesh_test_node: str
+  mesh_test_scenarios:
+    - str
+  baseline_start: str
+  baseline_end: str
   verbose: bool

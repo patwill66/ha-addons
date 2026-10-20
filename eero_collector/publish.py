@@ -9,11 +9,13 @@ current summaries, and publishes one retained JSON state per HA device:
                                        device's details (sensor "Selected device", attributes)
   eero_collector/mesh_map/<layout>  -> the mesh drawn as an SVG (meshmap.py; images "Mesh map" and
                                        "Mesh map (phone)" on "eero Network"), sent only when it changes
+  eero_collector/mesh_test[/...]    -> device "eero Mesh Test": backhaul placement tests (testpanel.py);
+                                       its controls send commands on eero_collector/mesh_test/<key>/set
 Discovery configs (homeassistant/<component>/eero_collector/<object>/config, retained) are sent at
 start and again whenever Home Assistant announces itself on homeassistant/status. Configs of entities
 that disappear (a client no longer tracked) are cleared. Availability follows the MQTT last will.
-The picker only chooses what this add-on shows; the choice is kept in /data/picker.json. Nothing here
-talks to eero.
+The picker only chooses what this add-on shows; the choice is kept in /data/picker.json. Mesh test
+commands are the only writes: they record test sessions in the collector database. Nothing here talks to eero.
 """
 
 import datetime
@@ -26,6 +28,7 @@ from zoneinfo import ZoneInfo
 
 import meshmap
 import mqtt
+import testpanel
 from collector import report
 
 BASE = "eero_collector"
@@ -71,7 +74,7 @@ class Builder:
             c["json_attributes_template"] = "{{ {" + ", ".join(f'"{a}": value_json.{a}' for a in attrs) + "} | tojson }}"
         if not enabled:
             c["enabled_by_default"] = False
-        if component == "image":  # an image has no state of its own, only image_topic
+        if component in ("image", "button"):  # no state of their own (an image has image_topic)
             del c["state_topic"], c["value_template"]
         self.configs[f"{DISCOVERY}/{component}/{BASE}/{object_id}/config"] = c
 
@@ -168,6 +171,11 @@ def node_configs(node, version):
     b.add("sensor", "cloud_since", "Connected to eero cloud since", v("cloud_since_iso"), device_class="timestamp",
           category="diagnostic")
     b.add("sensor", "upstream", "Upstream", v("upstream_text"), icon="mdi:transit-connection-variant")
+    if not node.get("is_gateway"):
+        b.add("sensor", "upstream_eero", "Upstream eero", v("upstream_eero"), icon="mdi:router-wireless")
+        b.add("sensor", "backhaul_radio", "Primary backhaul radio", v("backhaul_radio_text"), icon="mdi:wifi")
+        b.add("sensor", "direct_24h", "Direct to gateway (24 h)", v("direct_to_gateway_24h"), unit="%",
+              state_class="measurement", icon="mdi:arrow-up-bold")
     for w, label in (("24h", "24 h"), ("7d", "7 days")):
         b.add("sensor", f"upstream_changes_{w}", f"Upstream switches ({label})", v(f"upstream_changes_{w}"),
               unit="switches", state_class="measurement", icon="mdi:swap-horizontal")
@@ -235,7 +243,8 @@ def collect(db_path, tracked, tz, version, source):
         for n in nodes:
             st = {k: n.get(k) for k in ("online", "mesh_bars", "clients", "clients_wired", "clients_wireless",
                                         "os_version", "update_available", "location", "upstream_changes_24h",
-                                        "upstream_changes_7d")}
+                                        "upstream_changes_7d", "upstream_eero", "direct_to_gateway_24h")}
+            st["backhaul_radio_text"] = f"{n['backhaul_radio']} GHz" if n.get("backhaul_radio") else None
             st["last_reboot_iso"] = iso(n.get("last_reboot_at"))
             st["cloud_since_iso"] = iso(n["ts"] - n["cloud_uptime_s"]) if n.get("ts") and n.get("cloud_uptime_s") else None
             st["upstream_text"] = "wired" if n.get("connection_type") == "WIRED" else \
@@ -296,8 +305,14 @@ def picker_detail(db_path, device_id, label, tz):
 
 
 class Publisher:
-    def __init__(self, broker, db_path, tracked, interval, timezone, version, source, log):
+    def __init__(self, broker, db_path, tracked, interval, timezone, version, source, log, test_node=None,
+                 scenarios=()):
         self.broker, self.db_path, self.tracked = broker, db_path, tracked
+        self.test_node, self.scenarios = test_node, testpanel.parse_scenarios(scenarios)
+        self.commands = []  # mesh test commands from MQTT, applied in the publishing loop
+        self.test_message = None
+        self.test_shape = None  # view options and other satellites last announced in discovery
+        self.test_images = {}
         self.interval, self.tz, self.version, self.source, self.log = interval, ZoneInfo(timezone), version, source, log
         self.client = None
         self.resend = True
@@ -315,6 +330,8 @@ class Publisher:
             self.resend = True  # Home Assistant restarted: send discovery again
         elif topic == PICKER_SET:
             self.picked = payload.decode(errors="replace")
+        elif topic.startswith(testpanel.TOPIC + "/") and topic.endswith("/set"):
+            self.commands.append((topic[len(testpanel.TOPIC) + 1:-4], payload))
 
     def connect(self):
         self.client = mqtt.Client(self.broker["host"], int(self.broker["port"]), self.broker.get("username"),
@@ -323,12 +340,30 @@ class Publisher:
         self.client.connect()
         self.client.subscribe(f"{DISCOVERY}/status")
         self.client.subscribe(PICKER_SET)
+        self.client.subscribe(testpanel.SET)
         self.client.publish(AVAIL, "online", retain=True)
         self.resend = True
 
+    def apply_commands(self):
+        while self.commands:
+            key, payload = self.commands.pop(0)
+            try:
+                msg = testpanel.handle(self.db_path, key, payload, self.scenarios, self.test_node, self.tz,
+                                       int(time.time()))
+            except Exception as e:  # a bad command must not stop publishing
+                msg = f"{key} failed: {e}"
+            if msg:
+                self.test_message = f"{time.strftime('%H:%M')} {msg}"
+                self.log(f"mesh test: {msg}")
+
     def publish_once(self):
+        self.apply_commands()
         net, nodes, node_states, clients, missing, choices, maps = collect(self.db_path, self.tracked, self.tz,
                                                                            self.version, self.source)
+        test = testpanel.state(self.db_path, self.test_node, self.scenarios, self.tz, int(time.time()),
+                               self.test_message) if self.test_node else None
+        if test and (test[3], test[4]) != self.test_shape:
+            self.resend = True
         options = [label for _, label in choices]
         ids = {label: did for did, label in choices}
         if self.picked is not None:
@@ -354,6 +389,9 @@ class Publisher:
             for did, c in clients.items():
                 configs.update(client_configs({"id": did, **c}, self.version))
             configs.update(picker_configs(self.version, options))
+            if test:
+                configs.update(testpanel.configs(Builder, self.version, self.scenarios, test[3], test[4]))
+                self.test_shape = (test[3], test[4])
             self.options = options
             previous = set(json.loads(KNOWN_TOPICS.read_text())) if KNOWN_TOPICS.exists() else set()
             for topic in previous - set(configs):
@@ -363,6 +401,7 @@ class Publisher:
             KNOWN_TOPICS.write_text(json.dumps(sorted(configs)))
             self.resend = False
             self.maps = {}
+            self.test_images = {}
             time.sleep(1)  # let HA create the entities before the first states arrive
         self.client.publish(f"{BASE}/network", json.dumps(net, default=str), retain=True)
         for nid, st in node_states.items():
@@ -373,6 +412,15 @@ class Publisher:
             if self.maps.get(layout) != svg:
                 self.client.publish(f"{BASE}/mesh_map/{layout}", svg, retain=True)
                 self.maps[layout] = svg
+        if test:
+            payload, selected, comparison, _, _, charts = test
+            self.client.publish(testpanel.TOPIC, json.dumps(payload, default=str), retain=True)
+            self.client.publish(f"{testpanel.TOPIC}/selected", json.dumps(selected, default=str), retain=True)
+            self.client.publish(f"{testpanel.TOPIC}/comparison", json.dumps(comparison, default=str), retain=True)
+            for key, svg in charts.items():
+                if self.test_images.get(key) != svg:
+                    self.client.publish(f"{testpanel.TOPIC}/{key}", svg, retain=True)
+                    self.test_images[key] = svg
         if self.picker.get("id"):
             self.client.publish(f"{BASE}/picker", json.dumps({"label": self.picker["label"]}), retain=True)
             self.client.publish(f"{BASE}/picker/detail", json.dumps(
@@ -391,7 +439,7 @@ class Publisher:
                     self.log("publishing to Home Assistant again")
                 failing = False
                 for _ in range(self.interval):
-                    if stop.wait(1) or self.resend or self.picked is not None:
+                    if stop.wait(1) or self.resend or self.picked is not None or self.commands:
                         break
                     self.client.ping_if_idle()
             except Exception as e:  # never let publishing affect collection

@@ -26,6 +26,21 @@ is now: internet, the gateway, each eero under the eero it connects through (wir
 mesh bars), and per band its channel, clients and channel utilization (amber from 50 %, red from 75 %).
 Show them with a Picture entity card; they refresh when new eero data arrives.
 
+**Upstream:** each satellite eero has *Upstream eero* (the eero it connects through), *Primary backhaul radio* (the
+band of that link) and *Direct to gateway (24 h)*. eero often flips the band (5 ↔ 6 GHz) while staying on the same
+eero; those flips are not upstream switches. *Upstream switches* counts changes of eero only.
+
+**Mesh Test:** a device for controlled backhaul tests, such as moving an eero or opening a cabinet. Pick a
+*Scenario*, add *Notes*, press *Start test*, and *End test* when done. The first *Stabilization period* minutes
+aren't measured. Results count only valid time: 5-minute samples with a reported upstream; missed polls don't count
+as a connection. A test with fewer valid hours than *Preliminary below* is flagged preliminary, and coverage below
+*Coverage warning below* is flagged too. Changing a setting applies to the next test; each test keeps its own.
+*View* chooses what the metric sensors and the *Test chart* image show. *Comparison chart* and *Completed tests*
+(attributes) compare finished tests; the optional historical baseline is shown apart. Latency is Home Assistant's
+Ping to the gateway, so it describes the path from wherever Home Assistant is connected. eero's API reports no
+backhaul signal strength, PHY rate or throughput; throughput is only what you enter (*Throughput down / up*, then
+*Save throughput result*, which attaches it to the running test or the last completed one).
+
 ## Setup
 
 1. The **Mosquitto broker** add-on and the MQTT integration must be running. MQTT credentials come from
@@ -47,6 +62,10 @@ Show them with a Picture entity card; they refresh when new eero data arrives.
 | `sample_retention_days` | Keep 5-minute client samples this long; older ones are kept as hourly summaries |
 | `timezone` | Time zone for "today" (eero's day boundaries) |
 | `import_statistics` | Import network usage and eero speed-test history into HA's long-term statistics (`eero_collector:*`), then keep it current every hour (default on) |
+| `import_ping` | Copy Home Assistant's Ping readings (`sensor.ping_eero_gateway_*`, `sensor.ping_eero_<eero>_*`, `sensor.ping_internet_google_*` / `_cloudflare_*` and their binary sensors) into the database every 5 minutes, for mesh tests (default on) |
+| `mesh_test_node` | The eero the mesh tests are about (its location name in eero) |
+| `mesh_test_scenarios` | The scenarios offered by *Scenario*, each `CODE: description` |
+| `baseline_start`, `baseline_end` | Optional ISO 8601 window of normal operation, stored as the historical baseline for context |
 
 ## Data
 

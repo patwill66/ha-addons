@@ -134,6 +134,32 @@ MIGRATIONS = [
         window_start TEXT, window_end TEXT, json TEXT NOT NULL
     );
     """,
+    # 2 - mesh tests (backhaul placement experiments) and latency from an outside prober (Home Assistant Ping)
+    """
+    -- kind: trial | baseline. settings and summary are JSON; summary is frozen when a trial ends.
+    CREATE TABLE experiments (
+        id INTEGER PRIMARY KEY, kind TEXT NOT NULL, code TEXT NOT NULL UNIQUE, scenario TEXT, name TEXT NOT NULL,
+        node TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, settings TEXT NOT NULL, notes TEXT,
+        summary TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    -- Throughput measured by hand during a test (eero reports none for the backhaul).
+    CREATE TABLE experiment_throughput (
+        id INTEGER PRIMARY KEY, experiment_id INTEGER NOT NULL REFERENCES experiments(id), ts INTEGER NOT NULL,
+        down_mbps REAL, up_mbps REAL, note TEXT
+    );
+    -- Readings as the prober recorded them (metric rtt in ms, loss in %, up 0/1); each holds until the next one.
+    -- Kept sample_retention_days; ping_5min keeps 5-minute aggregates for good.
+    CREATE TABLE ping_samples (
+        target TEXT NOT NULL, metric TEXT NOT NULL, ts INTEGER NOT NULL, value REAL,
+        PRIMARY KEY (target, metric, ts)
+    ) WITHOUT ROWID;
+    -- rtt: point statistics of the readings in the bucket; loss and up: time-weighted mean over the bucket.
+    CREATE TABLE ping_5min (
+        target TEXT NOT NULL, metric TEXT NOT NULL, bucket INTEGER NOT NULL, n INTEGER NOT NULL,
+        mean REAL, median REAL, max REAL,
+        PRIMARY KEY (target, metric, bucket)
+    ) WITHOUT ROWID;
+    """,
 ]
 
 

@@ -12,12 +12,16 @@ Definitions:
   doesn't report every device as new.
 - Weak signal: below WEAK_SIGNAL_DBM. Poor link: eero's score_bars <= POOR_BARS.
 - Channel utilization is busy from UTIL_BUSY % and congested from UTIL_CONGESTED %.
+- A node's upstream has two parts, kept apart: the eero it connects through (`upstream_eero`; an upstream
+  change means this changed) and the band of that link (`backhaul_radio`, eero's primary_mesh_radio).
+  `direct_to_gateway_24h` is the share of valid time in the last 24 h spent directly on the gateway
+  (see meshtest for "valid").
 """
 
 import datetime
 import os
 
-from . import models
+from . import meshtest, models
 
 WEAK_SIGNAL_DBM = -70
 POOR_BARS = 2
@@ -120,9 +124,13 @@ def nodes(db, now=None):
         extra = {}
         if now is not None:
             extra = {"upstream_changes_24h": upstream_changes(db, n["id"], now - 86400),
-                     "upstream_changes_7d": upstream_changes(db, n["id"], now - 7 * 86400)}
+                     "upstream_changes_7d": upstream_changes(db, n["id"], now - 7 * 86400),
+                     "direct_to_gateway_24h": None if n["is_gateway"] else
+                     meshtest.direct_share(db, n["location"], now - 86400, now)}
+        parts = {"upstream_eero": meshtest.upstream_of(s) if s else None,
+                 "backhaul_radio": meshtest.band_of(s) if s else None}
         out.append({**n, **{k: v for k, v in s.items() if k not in ("node_id", "os_version")},
-                    "online": online, "radios": radios, **extra})
+                    "online": online, "radios": radios, **parts, **extra})
     return out
 
 

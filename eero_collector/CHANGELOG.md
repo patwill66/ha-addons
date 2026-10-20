@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0 (2026-10-20)
+
+- **Upstream, split in two:** each satellite eero adds "Upstream eero" (the eero it connects through) and "Primary
+  backhaul radio" (2.4 / 5 / 6 GHz, the band of that link), plus "Direct to gateway (24 h)" (share of the last day
+  spent directly on the gateway). Band flips on the same eero are not upstream switches; the switch counters are
+  unchanged. The combined "Upstream" sensor stays.
+- **Mesh Test** (new device): run backhaul placement tests from Home Assistant. Pick a scenario (add-on option
+  `mesh_test_scenarios`), press Start / End, add notes and hand-measured throughput. Target duration, stabilization
+  period, preliminary threshold and coverage warning are adjustable numbers; each test keeps the values it ran with.
+  Sessions and their final results are stored in the collector database, so they outlast HA's recorder.
+- Metrics for the viewed session (current, any completed test, the historical baseline, or all tests): direct /
+  via-eero shares of valid time, upstream changes per 24 h, band shares, gateway RTT median and p95, packet loss and
+  outages, coverage, valid samples, time since the last upstream change; warnings for restarts, firmware or channel
+  changes, collector gaps and outages. Two chart images: the session on one time axis, and the completed tests compared.
+- Latency comes from HA's Ping integration: the add-on copies its readings into the database every 5 minutes
+  (`import_ping`, on by default; raw readings kept `sample_retention_days`, 5-minute aggregates for good).
+- Optional historical baseline: set `baseline_start` / `baseline_end` (ISO 8601) to store a window of normal operation
+  for context. It is labelled as such and never mixed with controlled tests.
+
 ## 0.4.0 (2026-10-11)
 
 - **Mesh map:** two new images on eero Network, "Mesh map" (a tree, for wide screens) and "Mesh map (phone)" (a
