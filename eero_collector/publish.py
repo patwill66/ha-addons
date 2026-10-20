@@ -10,6 +10,8 @@ current summaries, and publishes one retained JSON state per HA device:
                                        device's details (sensor "Selected device", attributes)
   eero_collector/mesh_map/<layout>  -> the mesh drawn as an SVG (meshmap.py; images "Mesh map" and
                                        "Mesh map (phone)" on "eero Network"), sent only when it changes
+  eero_collector/event_filter       -> switches on "eero Network" choosing which kinds of device events the
+                                       dashboard lists (kept in /data/event_filter.json; display only)
   eero_collector/mesh_test[/...]    -> device "eero Mesh Test": backhaul placement tests (testpanel.py);
                                        its controls send commands on eero_collector/mesh_test/<key>/set
 Discovery configs (homeassistant/<component>/eero_collector/<object>/config, retained) are sent at
@@ -39,6 +41,11 @@ APP = pathlib.Path(__file__).resolve().parent
 KNOWN_TOPICS = pathlib.Path("/data/discovery_topics.json")
 PICKER = pathlib.Path("/data/picker.json")
 PICKER_SET = f"{BASE}/picker/set"
+EVENT_FILTER = pathlib.Path("/data/event_filter.json")
+FILTER_TOPIC = f"{BASE}/event_filter"
+EVENT_KINDS = (("connect", "connects"), ("disconnect", "disconnects"), ("roam", "roams"), ("band", "band changes"),
+               ("channel", "channel changes"), ("ip", "IP changes"))
+DEVICE_EVENTS = 100  # recent connection events per tracked device (the dashboard filters them by kind)
 MAP_LAYOUTS = (("wide", "mesh_map", "Mesh map"), ("tall", "mesh_map_phone", "Mesh map (phone)"))
 
 
@@ -66,7 +73,7 @@ class Builder:
                      ("icon", icon), ("entity_category", category)):
             if v:
                 c[k] = v
-        if component == "binary_sensor":
+        if component in ("binary_sensor", "switch"):
             c["payload_on"], c["payload_off"] = payload_on or "ON", "OFF"
         if attrs_topic:
             c["json_attributes_topic"] = attrs_topic
@@ -140,6 +147,9 @@ def network_configs(version):
           state_class="measurement", category="diagnostic")
     b.add("sensor", "eero_plus", "Eero Plus", v("premium_status"), category="diagnostic", icon="mdi:star-circle",
           attrs=["premium_locked"])
+    for kind, label in EVENT_KINDS:
+        b.add("switch", f"event_filter_{kind}", f"Show {label}", v(kind), state_topic=FILTER_TOPIC,
+              command_topic=f"{FILTER_TOPIC}/{kind}/set", icon="mdi:filter-outline", category="config")
     b.add("sensor", "addon_version", "Add-on version", v("addon_version"), category="diagnostic", icon="mdi:tag",
           attrs=["collector_source"])
     for layout, key, name in MAP_LAYOUTS:
@@ -273,9 +283,9 @@ def collect(db_path, tracked, tz, version, source):
                                 "tx_retry_pct": s.get("tx_retry_pct"), "today_mb": d["today_mb"],
                                 "last_hour_mb": d["last_hour_mb"], "week_mb": d["week_mb"],
                                 **{k: d[k] for k in ("drops_24h", "roams_24h")}}
-                timeline = report.device_timeline(db, did, now)
-                clients[did]["events"] = [{"at": iso(e["ts"]), "text": e["text"], "source": e["source"]}
-                                          for e in timeline]
+                timeline = report.device_timeline(db, did, now, limit=DEVICE_EVENTS)
+                clients[did]["events"] = [{"at": iso(e["ts"]), "kind": e["kind"], "text": e["text"],
+                                           "source": e["source"]} for e in timeline]
                 clients[did]["last_event"] = timeline[0]["text"][:250] if timeline else None
         choices = report.device_choices(db, now)
         topo = report.topology(nodes)
@@ -319,6 +329,12 @@ class Publisher:
         self.test_message = None
         self.test_shape = None  # view options and other satellites last announced in discovery
         self.test_images = {}
+        try:
+            self.event_filter = json.loads(EVENT_FILTER.read_text())
+        except (OSError, ValueError):
+            self.event_filter = {}
+        self.event_filter = {k: self.event_filter.get(k, "ON") for k, _ in EVENT_KINDS}
+        self.filter_changed = False
         self.interval, self.tz, self.version, self.source, self.log = interval, ZoneInfo(timezone), version, source, log
         self.client = None
         self.resend = True
@@ -336,6 +352,11 @@ class Publisher:
             self.resend = True  # Home Assistant restarted: send discovery again
         elif topic == PICKER_SET:
             self.picked = payload.decode(errors="replace")
+        elif topic.startswith(FILTER_TOPIC + "/") and topic.endswith("/set"):
+            kind, value = topic[len(FILTER_TOPIC) + 1:-4], payload.decode(errors="replace").strip().upper()
+            if kind in self.event_filter and value in ("ON", "OFF"):
+                self.event_filter[kind] = value
+                self.filter_changed = True
         elif topic.startswith(testpanel.TOPIC + "/") and topic.endswith("/set"):
             self.commands.append((topic[len(testpanel.TOPIC) + 1:-4], payload))
 
@@ -347,6 +368,7 @@ class Publisher:
         self.client.subscribe(f"{DISCOVERY}/status")
         self.client.subscribe(PICKER_SET)
         self.client.subscribe(testpanel.SET)
+        self.client.subscribe(f"{FILTER_TOPIC}/+/set")
         self.client.publish(AVAIL, "online", retain=True)
         self.resend = True
 
@@ -361,6 +383,12 @@ class Publisher:
             if msg:
                 self.test_message = f"{time.strftime('%H:%M')} {msg}"
                 self.log(f"mesh test: {msg}")
+
+    def publish_filter(self):
+        if self.filter_changed:
+            EVENT_FILTER.write_text(json.dumps(self.event_filter))
+            self.filter_changed = False
+        self.client.publish(FILTER_TOPIC, json.dumps(self.event_filter), retain=True)
 
     def publish_once(self):
         self.apply_commands()
@@ -410,6 +438,7 @@ class Publisher:
             self.test_images = {}
             time.sleep(1)  # let HA create the entities before the first states arrive
         self.client.publish(f"{BASE}/network", json.dumps(net, default=str), retain=True)
+        self.publish_filter()
         for nid, st in node_states.items():
             self.client.publish(f"{BASE}/node/{nid}", json.dumps(st), retain=True)
         for did, st in clients.items():
@@ -445,6 +474,8 @@ class Publisher:
                     self.log("publishing to Home Assistant again")
                 failing = False
                 for _ in range(self.interval):
+                    if self.filter_changed:  # a switch flipped: answer at once, without a full refresh
+                        self.publish_filter()
                     if stop.wait(1) or self.resend or self.picked is not None or self.commands:
                         break
                     self.client.ping_if_idle()

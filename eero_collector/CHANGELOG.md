@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.4 (2026-10-20)
+
+- Device events carry their kind (connect, disconnect, roam, band, channel, ip), and each tracked device keeps its
+  last 100. Six switches on "eero Network" ("Show connects", "Show roams", …) choose which kinds the dashboard's
+  device pages list. They only change what is shown; every event is still recorded.
+
 ## 0.5.3 (2026-10-20)
 
 - Tracked devices add "Last connection event", with the device's recent events (7 days, newest first) as

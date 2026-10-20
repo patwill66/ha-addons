@@ -260,7 +260,9 @@ def device_detail(db, device_id, now, tz):
 
 
 def device_timeline(db, device_id, now, days=7, limit=40):
-    """A device's recent connection events, newest first: [{ts, text, source}].
+    """A device's recent connection events, newest first: [{ts, kind, text, source}].
+
+    kind: connect, disconnect, roam, band, channel or ip (for filtering).
 
     Sources: eero's event feed ("eero": exact times; connects with the eero, band and channel, and disconnects),
     the 5-minute polls ("poll": roams between eeros, band and IP changes, and connects, disconnects or roams the
@@ -280,7 +282,8 @@ def device_timeline(db, device_id, now, days=7, limit=40):
                 text += f" · {e['band']} GHz" + (f" ch {e['channel']}" if e["channel"] else "")
         else:
             text = f"Disconnected from {e['node_location'] or 'its eero'}"
-        out.append({"ts": e["ts"], "text": text, "source": "eero"})
+        out.append({"ts": e["ts"], "kind": "connect" if e["action"] == "connected" else "disconnect", "text": text,
+                    "source": "eero"})
     for c in _all(db, """SELECT ts, kind, old, new FROM device_changes WHERE device_id = ? AND ts >= ? AND source = 'poll'
             AND kind IN ('node', 'band', 'ip', 'connected', 'disconnected') ORDER BY ts""", device_id, since):
         if c["kind"] == "node":
@@ -296,14 +299,15 @@ def device_timeline(db, device_id, now, days=7, limit=40):
             continue  # eero's feed already has it, with the exact time
         else:
             text = "Connected" if c["kind"] == "connected" else "Disconnected"
-        out.append({"ts": c["ts"], "text": text, "source": "poll"})
+        kind = {"node": "roam", "band": "band", "ip": "ip", "connected": "connect", "disconnected": "disconnect"}[c["kind"]]
+        out.append({"ts": c["ts"], "kind": kind, "text": text, "source": "poll"})
     prev = None
     for s in _all(db, "SELECT ts, band, channel FROM device_samples WHERE device_id = ? AND ts >= ? ORDER BY ts",
                   device_id, since):
         if (prev and s["ts"] - prev["ts"] <= 450 and s["band"] == prev["band"] and s["channel"] is not None
                 and prev["channel"] is not None and s["channel"] != prev["channel"]):
-            out.append({"ts": s["ts"], "text": f"Channel {prev['channel']} → {s['channel']} ({s['band']} GHz)",
-                        "source": "sample"})
+            out.append({"ts": s["ts"], "kind": "channel",
+                        "text": f"Channel {prev['channel']} → {s['channel']} ({s['band']} GHz)", "source": "sample"})
         prev = s
     return sorted(out, key=lambda e: e["ts"], reverse=True)[:limit]
 
