@@ -100,15 +100,15 @@ def svg_bars(values, labels, height=120, color="var(--accent)", unit=""):
             f"<text x='{w - 2}' y='{height + 12}' text-anchor='end'>{e(labels[-1] if labels else '')}</text></svg>")
 
 
-def svg_line(points, lo, hi, height=120, unit="", color="var(--accent)"):
-    """points: [(epoch, value)]; fixed y range lo..hi."""
+def svg_line(points, lo, hi, height=120, unit="", color="var(--accent)", tz=None):
+    """points: [(epoch, value)]; fixed y range lo..hi; time labels in tz."""
     if not points:
         return "<p class='muted'>No samples in this period.</p>"
     w = 900
     t0, t1 = points[0][0], max(points[-1][0], points[0][0] + 1)
     xy = [((t - t0) / (t1 - t0) * w, height - (min(max(v, lo), hi) - lo) / (hi - lo) * height) for t, v in points if v is not None]
     path = " ".join(f"{'M' if i == 0 else 'L'}{x:.1f},{y:.1f}" for i, (x, y) in enumerate(xy))
-    lab = lambda t: datetime.datetime.fromtimestamp(t).strftime("%b %d %H:%M")  # noqa: E731
+    lab = lambda t: datetime.datetime.fromtimestamp(t, tz).strftime("%b %d %H:%M")  # noqa: E731
     return (f"<svg viewBox='0 0 {w} {height + 14}' width='100%' preserveAspectRatio='none'>"
             f"<path d='{path}' fill='none' stroke='{color}' stroke-width='1.5'/>"
             f"<text x='2' y='10'>{hi} {e(unit)}</text><text x='2' y='{height - 2}'>{lo} {e(unit)}</text>"
@@ -287,7 +287,7 @@ class App:
                      "for the same eero and band on different channels show what a channel change did to this device.</p>")
         sig =[(x["ts"], x["signal"]) for x in s["samples"] if x["signal"] is not None]
         if sig:
-            body += "<h2>Signal, last 7 days</h2><div class='chart'>" + svg_line(sig, -90, -20, unit="dBm") + "</div>"
+            body += "<h2>Signal, last 7 days</h2><div class='chart'>" + svg_line(sig, -90, -20, unit="dBm", tz=self.tz) + "</div>"
         uh = s["usage_hourly"]
         if uh:
             labels = [datetime.datetime.fromtimestamp(x["hour"], self.tz).strftime("%a %H:00") for x in uh]
@@ -368,7 +368,7 @@ class App:
             for f in inc["findings"]) + "</ul>"
         sig = [(s["ts"], s["signal"]) for s in inc["samples"] if s["signal"] is not None]
         if len(sig) > 1:
-            body += "<h2>Signal</h2><div class='chart'>" + svg_line(sig, -90, -30, unit="dBm") + "</div>"
+            body += "<h2>Signal</h2><div class='chart'>" + svg_line(sig, -90, -30, unit="dBm", tz=self.tz) + "</div>"
         body += ("<h2>The device, every poll</h2><div class='wrap'><table><tr><th>Time</th><th>eero</th><th>Band</th>"
                  "<th class=n>Ch</th><th class=n>Signal</th><th class=n>SNR</th><th class=n>Bars</th><th class=n>Retry %</th>"
                  "<th class=n>rx Mbit/s</th><th class=n>tx Mbit/s</th></tr>")

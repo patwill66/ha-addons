@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.2 (2026-10-21)
+
+- Signal charts in the Web UI (device pages, What happened?) label their time axis in the add-on's time zone, not UTC.
+
 ## 0.6.1 (2026-10-21)
 
 - Fixes *Best eero* and *Time on a weaker eero*: a signal of 0 dBm (eero's placeholder when it hasn't measured one)
