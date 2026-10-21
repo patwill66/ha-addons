@@ -18,7 +18,7 @@ Definitions:
   (see meshtest for "valid").
 - A device's usual signal on an eero and band is the median of its samples there over TYPICAL_DAYS. Samples
   with SNR 0 are left out when there are others: eero reports SNR 0, often with a stale or low signal, right
-  after a connect.
+  after a connect. A signal of 0 dBm or more is eero's placeholder for "not measured" and is never used.
 - A roam is "to a weaker eero" when the device's usual signal on the eero it joined is ROAM_WEAKER_DB or more
   below its usual signal on the eero it left. Time "on a weaker eero" is time on an eero whose usual signal is
   ROAM_WEAKER_DB or more below the device's best eero on the same band; it means something for devices that stay
@@ -334,6 +334,11 @@ def device_timeline(db, device_id, now, days=7, limit=40):
     return sorted(out, key=lambda e: e["ts"], reverse=True)[:limit]
 
 
+def _dbm(signal):
+    """A measured signal, or None (eero reports 0 dBm when it hasn't measured one)."""
+    return signal if signal is not None and signal < 0 else None
+
+
 def _locations(db):
     return {str(r["id"]): r["location"] for r in _all(db, "SELECT id, location FROM nodes")}
 
@@ -342,7 +347,7 @@ def typical_signal(db, device_id, now, days=TYPICAL_DAYS):
     """{(node id, band): the device's usual signal in dBm} over the `days` before `now` (see the module docstring)."""
     good, every = defaultdict(list), defaultdict(list)
     for s in _all(db, """SELECT node_id, band, signal, snr FROM device_samples WHERE device_id = ? AND ts > ? AND ts <= ?
-            AND node_id IS NOT NULL AND signal IS NOT NULL""", device_id, now - days * 86400, now):
+            AND node_id IS NOT NULL AND signal < 0""", device_id, now - days * 86400, now):
         every[(s["node_id"], s["band"])].append(s["signal"])
         if s["snr"]:
             good[(s["node_id"], s["band"])].append(s["signal"])
@@ -371,8 +376,8 @@ def roams(db, device_id, lo, hi, now=None):
         old = _one(db, """SELECT node_id, band, signal FROM device_samples WHERE device_id = ? AND ts < ?
             ORDER BY ts DESC LIMIT 1""", device_id, c["ts"])
         nid = lambda x: int(x) if x and str(x).isdigit() else None  # noqa: E731
-        f = typical.get((nid(c["old"]), old.get("band")), old.get("signal"))
-        t = typical.get((nid(c["new"]), new.get("band")), new.get("signal"))
+        f = typical.get((nid(c["old"]), old.get("band")), _dbm(old.get("signal")))
+        t = typical.get((nid(c["new"]), new.get("band")), _dbm(new.get("signal")))
         out.append({"ts": c["ts"], "from": loc.get(c["old"], c["old"]), "to": loc.get(c["new"], c["new"]),
                     "band": new.get("band"), "from_dbm": f, "to_dbm": t,
                     "weaker": f is not None and t is not None and t <= f - ROAM_WEAKER_DB})
@@ -423,7 +428,7 @@ def signal_by(db, device_id, now, days=30):
         g = groups[(s["node_id"], s["band"], s["channel"])]
         g["secs"] += b - a
         g["last"] = max(g["last"], s["ts"])
-        if s["signal"] is not None:
+        if _dbm(s["signal"]) is not None:
             g["every"].append(s["signal"])
             if s["snr"]:
                 g["good"].append(s["signal"])
@@ -538,7 +543,7 @@ def incident(db, device_id, at, before=1800, after=1800, now=None):
             if a[col] and a[col] >= 100 and b[col] is not None and b[col] <= a[col] * RATE_DROP:
                 findings.append({"ts": b["ts"], "level": "warn", "text": f"Link rate ({word}) fell from {a[col]:g} to "
                                                                           f"{b[col]:g} Mbit/s on {b['node']}"})
-    weak = [s for s in samples if s["snr"] and s["signal"] is not None and s["signal"] < WEAK_SIGNAL_DBM]
+    weak = [s for s in samples if s["snr"] and _dbm(s["signal"]) is not None and s["signal"] < WEAK_SIGNAL_DBM]
     if weak:
         w = min(weak, key=lambda s: s["signal"])
         findings.append({"ts": w["ts"], "level": "warn", "text": f"Weak signal: down to {w['signal']} dBm on {w['node']} "

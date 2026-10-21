@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1 (2026-10-21)
+
+- Fixes *Best eero* and *Time on a weaker eero*: a signal of 0 dBm (eero's placeholder when it hasn't measured one)
+  counted as a real reading, so a device could show a "best eero" at 0 dBm and a whole day on a weaker eero.
+
 ## 0.6.0 (2026-10-21)
 
 - **What happened?** (new Web UI page): pick a device and a moment; it lines up the device's polls and events, its
