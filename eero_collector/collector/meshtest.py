@@ -17,6 +17,9 @@ Definitions (they decide what Home Assistant's "Mesh Testing" view shows):
 - Preliminary: fewer than `preliminary_hours` valid hours. Low coverage: below `coverage_warn_pct`.
 - Events that make a result suspect are listed with their times: reboots, firmware changes, 5/6 GHz channel
   changes, collector gaps, internet outages and eero's "offline" LED events.
+- Channels: share of the window each 5/6 GHz channel was in use, from the gateway's radios (eero moves every
+  eero's channel together). A trial whose main channel on a band differs from the baseline's gets a warning: a
+  channel change alone can move signal and backhaul choices, even when it happened before the trial started.
 eero's API has no backhaul RSSI, PHY rate or throughput; throughput is only what was entered by hand.
 
 Everything above is read-only. The functions under "writes" are the only ones that change the database.
@@ -284,6 +287,41 @@ def events(db, lo, hi):
     return sorted(out, key=lambda e: e["ts"])
 
 
+def channels(db, lo, hi):
+    """{band: {channel: % of [lo, hi)}} for the gateway's 5 and 6 GHz radios, biggest share first."""
+    gw = _one(db, "SELECT id FROM nodes WHERE is_gateway = 1 ORDER BY last_seen_at DESC LIMIT 1").get("id")
+    out = {}
+    for band in ("5", "5L", "5H", "6"):
+        rows = _all(db, "SELECT ts, channel FROM radio_samples WHERE node_id = ? AND band = ? AND ts BETWEEN ? AND ? ORDER BY ts",
+                    gw, band, lo - GAP, hi)
+        secs = Counter()
+        for a, b, s in segments(rows, lo, hi):
+            if s["channel"] is not None:
+                secs[str(s["channel"])] += b - a
+        total = sum(secs.values())
+        if total:
+            out[band] = {ch: round(100 * n / total, 1) for ch, n in secs.most_common()}
+    return out
+
+
+def _channel_warnings(db, start, ch):
+    """Warnings for bands whose main channel differs from the baseline's (none for the baseline itself)."""
+    base = session(db, BASELINE)
+    if not base or base["started_at"] == start:
+        return []
+    s = base["summary"] or {}
+    theirs = s.get("channels") or channels(db, s.get("measure_from") or base["started_at"],
+                                           s.get("measure_to") or base["ended_at"] or start)
+    out = []
+    for band, mine in ch.items():
+        other = theirs.get(band)
+        if other and next(iter(mine)) != next(iter(other)):
+            (a, pa), (b, pb) = next(iter(mine.items())), next(iter(other.items()))
+            out.append(f"{band} GHz ran on channel {a} ({pa:g} %); the baseline ran on channel {b} ({pb:g} %). "
+                       "A channel change alone can shift results, so compare with the baseline with care.")
+    return out
+
+
 # --- a session's measurements ----------------------------------------------------------------------------------
 def settings_of(raw):
     s = dict(DEFAULTS)
@@ -334,7 +372,12 @@ def metrics(db, node, start, end, settings, now, tz=datetime.timezone.utc):
         if n:
             warnings.append(f"{n} {word}{'s' if n > 1 else ''} during the measurement.")
             flags.append(kind)
-    return {**base, "measuring": True, **r, "latency": lat, "events": ev, "others": others,
+    ch = channels(db, lo, hi)
+    differs = _channel_warnings(db, start, ch)
+    if differs:
+        warnings += differs
+        flags.append("channel_differs")
+    return {**base, "measuring": True, **r, "latency": lat, "events": ev, "others": others, "channels": ch,
             "flags": flags, "warnings": warnings}
 
 

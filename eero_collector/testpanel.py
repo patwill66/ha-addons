@@ -188,7 +188,7 @@ def _flat(m, kind, label, code, name, measured_by):
         "measure_to": iso(m.get("measure_to")), "node": m.get("node"), "gateway": m.get("gateway"),
         "direct_pct": m.get("direct_pct") if measuring else None,
         "via": {k: v for k, v in route.items() if k != m.get("gateway")} if measuring else {},
-        "route_pct": route, "band_pct": m.get("band_pct") or {},
+        "route_pct": route, "band_pct": m.get("band_pct") or {}, "channels": m.get("channels") or {},
         "changes_per_24h": m.get("changes_per_24h"), "upstream_changes": m.get("upstream_changes"),
         "band_only_changes": m.get("band_only_changes"),
         "rtt_median_ms": lat.get("rtt_median_ms"), "rtt_p95_ms": lat.get("rtt_p95_ms"), "rtt_n": lat.get("rtt_n"),
@@ -217,7 +217,7 @@ def _row(s, m):
             "valid_hours": m.get("valid_hours"), "valid_samples": m.get("valid_samples"),
             "coverage_pct": m.get("coverage_pct"), "direct_pct": m.get("direct_pct"), "route_pct": m.get("route_pct") or {},
             "changes_per_24h": m.get("changes_per_24h"), "band_pct": m.get("band_pct") or {},
-            "rtt_median_ms": lat.get("rtt_median_ms"), "rtt_p95_ms": lat.get("rtt_p95_ms"),
+            "channels": m.get("channels") or {}, "rtt_median_ms": lat.get("rtt_median_ms"), "rtt_p95_ms": lat.get("rtt_p95_ms"),
             "loss_pct": lat.get("loss_pct"), "outages": lat.get("outages"),
             "internet_outages": lat.get("internet_outages"),
             "throughput_down_median": downs[len(downs) // 2] if downs else None,
@@ -290,6 +290,12 @@ def state(db_path, node, scenarios, tz, now, message=None):
         }
         rows = [_row(t, t["summary"] or {}) for t in completed]
         baseline_row = _row(base, base["summary"] or {}) if base else None
+        if base and not baseline_row["channels"]:  # baselines frozen before 0.6.0 have no channels: work them out
+            bs = base["summary"] or {}
+            baseline_row["channels"] = meshtest.channels(db, bs.get("measure_from") or base["started_at"],
+                                                         bs.get("measure_to") or base["ended_at"] or now)
+            if sel is not None and sel["id"] == base["id"]:
+                selected["channels"] = baseline_row["channels"]
         comparison = {"trials": rows, "baseline": baseline_row,
                       "baseline_note": "Normal operation before testing; uncontrolled, not a comparable trial."}
 

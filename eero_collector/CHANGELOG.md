@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0 (2026-10-21)
+
+- **What happened?** (new Web UI page): pick a device and a moment; it lines up the device's polls and events, its
+  usual signal per eero, each eero's status, upstream and channel use, mesh changes and other devices' changes for
+  ± 15–120 minutes, with findings on top: roams to a weaker eero, link-rate drops, weak signal, mesh changes (or
+  none), busy channels, and whether other devices changed at the same moment.
+- **Weaker eeros:** a roam counts as "to a weaker eero" when the device's usual signal there (7-day median) is 6 dB
+  or more below the eero it left; time "on a weaker eero" is time on an eero 6 dB or more below its best on the
+  same band. Tracked devices add *Roams to a weaker eero (24 h)*, *Time on a weaker eero (24 h)* and *Best eero*;
+  the event list marks those roams with the usual signals.
+- **Signal by eero, band and channel** (30 days) on device pages and as *Best eero* attributes, so a channel
+  change's effect on a device shows directly.
+- **Mesh changes:** *Last mesh change* on eero Network (attributes: last 7 days) and on the status page: restarts,
+  firmware, 5/6 GHz channel changes, upstream eero changes (band flips left out), collector gaps, internet outages.
+- **Mesh Test:** each test records the 5/6 GHz channels it ran on (*Wi-Fi channels*, and a row in the comparison)
+  and warns when its main channel differs from the baseline's, even if the change came before the test started.
+
 ## 0.5.4 (2026-10-20)
 
 - Device events carry their kind (connect, disconnect, roam, band, channel, ip), and each tracked device keeps its

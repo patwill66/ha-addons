@@ -3,7 +3,8 @@
   GET  /                status, eero login, data sources (free / Eero Plus), backfill, API use
   POST login, verify    eero login: identifier -> eero sends a code -> code (stored in /data/session.json)
   GET  devices          every device eero knows: sortable, searchable table
-  GET  device?id=N      one device: link quality, usage and change history with charts
+  GET  device?id=N      one device: link quality, signal per eero/band/channel, usage and change history
+  GET  incident         "What happened?": one device and the mesh around a moment (?id=N&at=YYYY-MM-DDTHH:MM&win=min)
   GET  snapshot         a consistent copy of the database (SQLite online backup, read-only)
 
 Only the Supervisor's ingress proxy may connect; Home Assistant authenticates the user. The database
@@ -44,8 +45,10 @@ h1{font-size:20px;margin:8px 0 16px} h2{font-size:16px;margin:24px 0 8px}
 table{border-collapse:collapse;width:100%} th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
 th{cursor:pointer;user-select:none;position:sticky;top:0;background:var(--bg)} td.n,th.n{text-align:right}
 .wrap{overflow-x:auto} .muted{color:var(--muted)} .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
-input[type=text],input[type=search]{padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);min-width:240px}
+input[type=text],input[type=search],input[type=datetime-local],select{padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);min-width:240px}
 button{padding:8px 14px;border:0;border-radius:8px;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}
+ul.find{list-style:none;padding:0} ul.find li{padding:4px 0;border-bottom:1px solid var(--line)}
+form.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 svg text{fill:var(--muted);font-size:10px} .chart{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px;margin:8px 0}
 """
 
@@ -63,7 +66,7 @@ const q=document.getElementById('q'); if(q) q.oninput=()=>{const s=q.value.toLow
 def page(title, body):
     return (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"<title>{e(title)}</title><style>{CSS}</style></head><body><main>"
-            f"<nav><a href='./'>Status</a><a href='devices'>Devices</a></nav><h1>{e(title)}</h1>{body}"
+            f"<nav><a href='./'>Status</a><a href='devices'>Devices</a><a href='incident'>What happened?</a></nav><h1>{e(title)}</h1>{body}"
             f"</main><script>{SORT_JS}</script></body></html>").encode()
 
 
@@ -141,6 +144,7 @@ class App:
             bf = {r["name"]: dict(r) for r in db.execute("SELECT * FROM backfill")}
             hourly = [dict(r) for r in db.execute("SELECT * FROM usage_network_hourly WHERE hour >= ? ORDER BY hour",
                                                   (now - 48 * 3600,))]
+            changes = report.mesh_changes(db, now - 7 * 86400, now)[::-1]
         finally:
             db.close()
         state = n["collector_state"] or "unknown"
@@ -171,7 +175,8 @@ class App:
             body += (f"<tr><td>{e(x['location'] or '')}</td><td class='{'ok' if x['online'] else 'bad'}'>{'online' if x['online'] else 'offline'}</td>"
                      f"<td class=n>{x.get('mesh_bars') or '—'}/5</td><td>{e(up)}</td><td class=n>{x.get('clients')}</td>"
                      f"<td>{e(radios)}</td><td>{ago(x.get('last_reboot_at'), now)}</td><td>{e(x.get('os_version') or '')}</td></tr>")
-        body += "</table></div><h2>Data sources</h2><table><tr><th>Source</th><th>Needs</th><th>Status</th><th>Checked</th></tr>"
+        body += "</table></div><h2>Mesh changes, last 7 days</h2>" + self.change_list(changes)
+        body += "<h2>Data sources</h2><table><tr><th>Source</th><th>Needs</th><th>Status</th><th>Checked</th></tr>"
         for c in caps:
             st = {"ok": "<span class=ok>collecting</span>", "not_entitled": "<span class=muted>locked (Eero Plus)</span>"}.get(
                 c["status"], f"<span class=bad>{e(c['status'])}</span>")
@@ -244,6 +249,8 @@ class App:
                 return None
             s = report.device_series(db, device_id, now, days=7)
             nodes = {r[0]: r[1] for r in db.execute("SELECT id, location FROM nodes")}
+            q = report.roam_summary(db, device_id, now)
+            by = report.signal_by(db, device_id, now)
         finally:
             db.close()
         cur = d["sample"] or {}
@@ -256,7 +263,29 @@ class App:
                  ("First seen by eero", (d.get("eero_first_seen") or "—")[:10]), ("Type", d.get("device_type") or "—")]
         body = "<div class='cards'>" + "".join(f"<div class='card'><b>{e(str(v))}</b><span>{e(k)}</span></div>" for k, v in cards) + "</div>"
         body += f"<p class='muted'>{e(d.get('manufacturer') or '')} · {e(d.get('mac') or '')} · {e(d.get('ip') or '')}{' · private MAC' if d.get('is_private') else ''}</p>"
-        sig = [(x["ts"], x["signal"]) for x in s["samples"] if x["signal"] is not None]
+        body += (f"<p><a href='incident?id={device_id}'>What happened? Look at this device and the mesh around a moment →</a></p>"
+                 "<h2>Roaming, last 24 hours</h2><div class='cards'>")
+        for k, v in (("Roams", q["roams"]), ("Roams to a weaker eero", q["weaker_roams"]),
+                     ("Minutes on a weaker eero", q["weaker_minutes"]),
+                     ("Best eero", f"{q['best_eero']} {q['best_band']} GHz · {q['best_dbm']} dBm" if q["best_eero"] else "—")):
+            warn = k in ("Roams to a weaker eero", "Minutes on a weaker eero") and v
+            body += f"<div class='card'><b class='{'warn' if warn else ''}'>{e(str(v))}</b><span>{e(k)}</span></div>"
+        body += (f"</div><p class='muted'>A weaker eero is one where this device's usual signal is {report.ROAM_WEAKER_DB} dB "
+                 "or more below the eero it left, or below its best eero on the same band (medians over 7 days). "
+                 "That means most for devices that stay in one place.</p>")
+        if by:
+            body += ("<h2>Signal by eero, band and channel, last 30 days</h2><div class='wrap'><table class='sort'><thead><tr>"
+                     "<th>eero</th><th>Band</th><th class=n>Channel</th><th class=n>Hours</th><th class=n>Signal (median)</th>"
+                     "<th class=n>rx Mbit/s</th><th class=n>tx Mbit/s</th><th class=n>Retry %</th><th>Last</th></tr></thead><tbody>")
+            for r in by:
+                cls = "bad" if r["signal"] is not None and r["signal"] < report.WEAK_SIGNAL_DBM else ""
+                body += (f"<tr><td>{e(str(r['node']))}</td><td>{e(r['band'] or '')}</td><td class=n>{r['channel'] or ''}</td>"
+                         f"<td class=n>{r['hours']}</td><td class='n {cls}'>{r['signal'] if r['signal'] is not None else ''}</td>"
+                         f"<td class=n>{r['rx_mbps'] or ''}</td><td class=n>{r['tx_mbps'] or ''}</td>"
+                         f"<td class=n>{r['retry_pct'] if r['retry_pct'] is not None else ''}</td><td>{ago(r['last'], now)}</td></tr>")
+            body += ("</tbody></table></div><p class='muted'>eero moves every eero's 5 and 6 GHz channel together, so rows "
+                     "for the same eero and band on different channels show what a channel change did to this device.</p>")
+        sig =[(x["ts"], x["signal"]) for x in s["samples"] if x["signal"] is not None]
         if sig:
             body += "<h2>Signal, last 7 days</h2><div class='chart'>" + svg_line(sig, -90, -20, unit="dBm") + "</div>"
         uh = s["usage_hourly"]
@@ -277,6 +306,115 @@ class App:
             body += f"<tr><td>{when}</td><td>{e(c['kind'])}</td><td>{e(str(old or ''))}</td><td>{e(str(new or ''))}</td><td class=muted>{e(c['source'])}</td></tr>"
         body += "</table>"
         return page(d["name"] or "Device", body)
+
+    def when(self, t, fmt="%a %b %-d %H:%M"):
+        return datetime.datetime.fromtimestamp(t, self.tz).strftime(fmt) if t else ""
+
+    def change_list(self, changes):
+        if not changes:
+            return "<p class='muted'>None.</p>"
+        return "<ul class='find'>" + "".join(
+            f"<li><b>{self.when(c['ts'])}</b> · <span class='{'bad' if c['kind'] in ('reboot', 'internet') else ''}'>"
+            f"{e(c['text'])}</span></li>" for c in changes) + "</ul>"
+
+    WINDOWS = (15, 30, 60, 120)
+
+    def incident(self, q):
+        """The "What happened?" page: a form, and when it names a device and a time, the report around it."""
+        now = int(time.time())
+        raw_id, raw_at = q.get("id", [""])[0], q.get("at", [""])[0]
+        win = int(q["win"][0]) if q.get("win", [""])[0] in {str(w) for w in self.WINDOWS} else 30
+        at, message = None, ""
+        if raw_at:
+            try:
+                at = int(datetime.datetime.strptime(raw_at[:16], "%Y-%m-%dT%H:%M").replace(tzinfo=self.tz).timestamp())
+            except ValueError:
+                message = "That time wasn't understood."
+        db = self.ro()
+        try:
+            choices = report.device_choices(db, now)
+            inc = report.incident(db, int(raw_id), at, win * 60, win * 60, now) if raw_id.isdigit() and at else None
+        finally:
+            db.close()
+        default_at = raw_at[:16] if at else datetime.datetime.fromtimestamp(now - 600, self.tz).strftime("%Y-%m-%dT%H:%M")
+        opts = "".join(f"<option value='{did}'{' selected' if str(did) == raw_id else ''}>{e(label)}</option>"
+                       for did, label in choices)
+        wins = "".join(f"<option value='{w}'{' selected' if w == win else ''}>± {w} min</option>" for w in self.WINDOWS)
+        body = ("<p class='muted'>Pick a device and the moment something went wrong (a call dropped, a page stalled). "
+                "This lines up the device's own polls and events with what the mesh and other devices did around it.</p>"
+                f"<form class='row' method='get' action='incident'><select name='id' required><option value=''>Device…</option>{opts}"
+                f"</select><input type='datetime-local' name='at' value='{e(default_at)}' required>"
+                f"<select name='win'>{wins}</select><button>Show</button></form>")
+        if message:
+            body += f"<p class='warn'>{e(message)}</p>"
+        if raw_id.isdigit() and at and inc is None:
+            body += "<p class='warn'>That device isn't known.</p>"
+        if not inc:
+            return page("What happened?", body)
+        return page(f"What happened? {inc['device']['name']}", body + self.incident_report(inc, raw_id, win))
+
+    def incident_report(self, inc, raw_id, win):
+        hm = lambda t: self.when(t, "%H:%M:%S")  # noqa: E731
+        step = lambda t: datetime.datetime.fromtimestamp(t, self.tz).strftime("%Y-%m-%dT%H:%M")  # noqa: E731
+        span = win * 60
+        body = (f"<p><b>{e(inc['device']['name'])}</b> · {self.when(inc['from'])} → {self.when(inc['to'], '%H:%M')} "
+                f"(around {self.when(inc['at'], '%H:%M')}) · "
+                f"<a href='incident?id={raw_id}&at={step(inc['at'] - span)}&win={win}'>← earlier</a> · "
+                f"<a href='incident?id={raw_id}&at={step(inc['at'] + span)}&win={win}'>later →</a> · "
+                f"<a href='device?id={raw_id}'>device page</a></p>")
+        cls = {"bad": "bad", "warn": "warn", "info": "muted"}
+        body += "<h2>Findings</h2><ul class='find'>" + "".join(
+            f"<li><b>{hm(f['ts']) if f['ts'] else ''}</b> <span class='{cls[f['level']]}'>{e(f['text'])}</span></li>"
+            for f in inc["findings"]) + "</ul>"
+        sig = [(s["ts"], s["signal"]) for s in inc["samples"] if s["signal"] is not None]
+        if len(sig) > 1:
+            body += "<h2>Signal</h2><div class='chart'>" + svg_line(sig, -90, -30, unit="dBm") + "</div>"
+        body += ("<h2>The device, every poll</h2><div class='wrap'><table><tr><th>Time</th><th>eero</th><th>Band</th>"
+                 "<th class=n>Ch</th><th class=n>Signal</th><th class=n>SNR</th><th class=n>Bars</th><th class=n>Retry %</th>"
+                 "<th class=n>rx Mbit/s</th><th class=n>tx Mbit/s</th></tr>")
+        prev = None
+        for s in inc["samples"]:
+            moved = prev is not None and s["node_id"] != prev
+            weak = s["signal"] is not None and s["signal"] < report.WEAK_SIGNAL_DBM
+            body += (f"<tr><td>{hm(s['ts'])}</td><td class='{'warn' if moved else ''}'>{e(str(s['node']))}</td>"
+                     f"<td>{e(s['band'] or '')}</td><td class=n>{s['channel'] or ''}</td>"
+                     f"<td class='n {'bad' if weak else ''}'>{s['signal'] if s['signal'] is not None else ''}</td>"
+                     f"<td class=n>{s['snr'] if s['snr'] is not None else ''}</td><td class=n>{s['score_bars'] or ''}</td>"
+                     f"<td class=n>{s['tx_retry_pct'] if s['tx_retry_pct'] is not None else ''}</td>"
+                     f"<td class=n>{s['rx_rate_mbps'] or ''}</td><td class=n>{s['tx_rate_mbps'] or ''}</td></tr>")
+            prev = s["node_id"]
+        body += "</table></div><p class='muted'>SNR 0 right after a connect usually means eero hasn't measured the link yet.</p>"
+        body += "<h2>The device's events</h2>"
+        if inc["events"]:
+            body += "<ul class='find'>" + "".join(
+                f"<li><b>{hm(x['ts'])}</b> {e(x['text'])} <span class='muted'>· {e(x['source'])}</span></li>"
+                for x in inc["events"]) + "</ul>"
+        else:
+            body += "<p class='muted'>None.</p>"
+        body += ("<h2>Its usual signal per eero (7 days)</h2><table><tr><th>eero</th><th>Band</th><th class=n>Usual signal</th></tr>"
+                 + "".join(f"<tr><td>{e(str(u['node']))}</td><td>{e(u['band'] or '')}</td><td class=n>{u['dbm']} dBm</td></tr>"
+                           for u in inc["usual"]) + "</table>")
+        body += ("<h2>The mesh</h2><div class='wrap'><table><tr><th>eero</th><th>Online</th><th>Upstream</th>"
+                 "<th>Clients</th><th>Radios (channel · busiest)</th></tr>")
+        for n in inc["nodes"]:
+            radios = " · ".join(f"{r['band']} GHz ch {'/'.join(map(str, r['channels']))} "
+                                f"{r['max_util'] if r['max_util'] is not None else '—'} %" for r in n["radios"])
+            online = "—" if n["online"] is None else "yes" if n["online"] else "<span class=bad>no</span>"
+            clients = f"{n['clients'][0]}–{n['clients'][1]}" if n["clients"] else "—"
+            body += (f"<tr><td>{e(n['node'])}</td><td>{online}</td><td>{e(' → '.join(n['upstreams']))}</td>"
+                     f"<td>{clients}</td><td>{e(radios)}</td></tr>")
+        body += "</table></div><h2>Mesh changes</h2>" + self.change_list(inc["mesh_changes"])
+        near = {(o["ts"], o["device"]) for o in inc["nearby"]}
+        body += f"<h2>Other devices ({len(inc['others'])})</h2>"
+        if inc["others"]:
+            body += "<div class='wrap'><table><tr><th>Time</th><th>Device</th><th>What</th><th>Source</th></tr>" + "".join(
+                f"<tr><td>{hm(o['ts'])}</td><td class='{'warn' if (o['ts'], o['device']) in near else ''}'>{e(o['device'])}</td>"
+                f"<td>{e(o['text'])}</td><td class=muted>{e(o['source'])}</td></tr>" for o in inc["others"]) + "</table></div>"
+            body += (f"<p class='muted'>Highlighted: within {report.NEARBY_S // 60} min of this device's own changes. "
+                     "Many devices changing together points at the mesh; this device alone points at its own link.</p>")
+        else:
+            body += "<p class='muted'>None.</p>"
+        return body
 
     # --- login --------------------------------------------------------------------------------------
     def login(self, identifier):
@@ -329,6 +467,8 @@ def make_handler(app):
                 elif path == "/device" and q.get("id", [""])[0].isdigit():
                     out = app.device(int(q["id"][0]))
                     self.reply(out) if out else self.send_error(404)
+                elif path == "/incident":
+                    self.reply(app.incident(q))
                 elif path == "/snapshot":
                     self.snapshot()
                 else:

@@ -5,7 +5,9 @@ current summaries, and publishes one retained JSON state per HA device:
   eero_collector/network            -> device "eero Network"
   eero_collector/node/<node id>     -> one device per eero node
   eero_collector/client/<device id> -> one device per tracked client (option tracked_devices), including its
-                                       recent connection events (report.device_timeline) as attributes
+                                       recent connection events (report.device_timeline), roams to a weaker
+                                       eero (report.roam_summary) and its signal per eero, band and channel
+                                       (report.signal_by) as attributes
   eero_collector/picker             -> the device picker (a select on "eero Network") and the chosen
                                        device's details (sensor "Selected device", attributes)
   eero_collector/mesh_map/<layout>  -> the mesh drawn as an SVG (meshmap.py; images "Mesh map" and
@@ -46,6 +48,8 @@ FILTER_TOPIC = f"{BASE}/event_filter"
 EVENT_KINDS = (("connect", "connects"), ("disconnect", "disconnects"), ("roam", "roams"), ("band", "band changes"),
                ("channel", "channel changes"), ("ip", "IP changes"))
 DEVICE_EVENTS = 100  # recent connection events per tracked device (the dashboard filters them by kind)
+MESH_CHANGES = 40  # recent mesh changes (report.mesh_changes, last 7 days) on "eero Network"
+SIGNAL_ROWS = 20  # rows of a tracked device's signal per eero, band and channel (last 30 days)
 MAP_LAYOUTS = (("wide", "mesh_map", "Mesh map"), ("tall", "mesh_map_phone", "Mesh map (phone)"))
 
 
@@ -127,6 +131,8 @@ def network_configs(version):
               state_class="measurement", icon="mdi:wifi")
     b.add("sensor", "network_event", "Last network event", "{{ value_json.network_event_text }}",
           icon="mdi:format-list-bulleted", attrs=["network_events"])
+    b.add("sensor", "mesh_change", "Last mesh change", "{{ value_json.mesh_change_text }}",
+          icon="mdi:source-branch", attrs=["mesh_changes"])
     b.add("sensor", "weak_signal", "Weak-signal devices", v("weak_signal_count"), unit="devices",
           state_class="measurement", icon="mdi:wifi-strength-1-alert", attrs=["weak_signal"])
     b.add("sensor", "poor_link", "Poor-link devices", v("poor_link_count"), unit="devices",
@@ -229,6 +235,11 @@ def client_configs(d, version):
     for k, label, icon in (("drops", "Disconnects", "mdi:lan-disconnect"), ("roams", "Roams", "mdi:swap-horizontal")):
         b.add("sensor", f"{k}_24h", f"{label} (24 h)", v(f"{k}_24h"), unit=k, state_class="measurement", icon=icon)
     b.add("sensor", "last_event", "Last connection event", v("last_event"), icon="mdi:history", attrs=["events"])
+    b.add("sensor", "weaker_roams_24h", "Roams to a weaker eero (24 h)", v("weaker_roams_24h"), unit="roams",
+          state_class="measurement", icon="mdi:wifi-arrow-down")
+    b.add("sensor", "weaker_minutes_24h", "Time on a weaker eero (24 h)", v("weaker_minutes_24h"), unit="min",
+          device_class="duration", state_class="measurement", icon="mdi:timer-alert-outline")
+    b.add("sensor", "signal_by", "Best eero", v("best_text"), icon="mdi:wifi-star", attrs=["signal_by"])
     return b.configs
 
 
@@ -250,6 +261,9 @@ def collect(db_path, tracked, tz, version, source):
         net["speedtests"] = [{"at": iso(s["ts"]), "down": s["down_mbps"], "up": s["up_mbps"]} for s in net["speedtests"]]
         net["network_events"] = [{"at": iso(e["ts"]), "text": e["text"]} for e in net["network_events"]]
         net["network_event_text"] = (net["network_events"][0]["text"][:250] if net["network_events"] else None)
+        changes = report.mesh_changes(db, now - 7 * 86400, now)[::-1][:MESH_CHANGES]
+        net["mesh_changes"] = [{"at": iso(c["ts"]), "kind": c["kind"], "text": c["text"]} for c in changes]
+        net["mesh_change_text"] = changes[0]["text"][:250] if changes else "none in 7 days"
         nodes = report.nodes(db, now)
         node_states = {}
         for n in nodes:
@@ -287,6 +301,12 @@ def collect(db_path, tracked, tz, version, source):
                 clients[did]["events"] = [{"at": iso(e["ts"]), "kind": e["kind"], "text": e["text"],
                                            "source": e["source"]} for e in timeline]
                 clients[did]["last_event"] = timeline[0]["text"][:250] if timeline else None
+                q = report.roam_summary(db, did, now)
+                clients[did].update(weaker_roams_24h=q["weaker_roams"], weaker_minutes_24h=q["weaker_minutes"],
+                                    best_text=f"{q['best_eero']} {q['best_band']} GHz · {q['best_dbm']} dBm"
+                                    if q["best_eero"] else None)
+                clients[did]["signal_by"] = [{**r, "last": iso(r["last"])}
+                                             for r in report.signal_by(db, did, now)[:SIGNAL_ROWS]]
         choices = report.device_choices(db, now)
         topo = report.topology(nodes)
         as_of = max((n["ts"] for n in nodes if n.get("ts")), default=None)

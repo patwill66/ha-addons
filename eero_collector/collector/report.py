@@ -16,10 +16,19 @@ Definitions:
   change means this changed) and the band of that link (`backhaul_radio`, eero's primary_mesh_radio).
   `direct_to_gateway_24h` is the share of valid time in the last 24 h spent directly on the gateway
   (see meshtest for "valid").
+- A device's usual signal on an eero and band is the median of its samples there over TYPICAL_DAYS. Samples
+  with SNR 0 are left out when there are others: eero reports SNR 0, often with a stale or low signal, right
+  after a connect.
+- A roam is "to a weaker eero" when the device's usual signal on the eero it joined is ROAM_WEAKER_DB or more
+  below its usual signal on the eero it left. Time "on a weaker eero" is time on an eero whose usual signal is
+  ROAM_WEAKER_DB or more below the device's best eero on the same band; it means something for devices that stay
+  in one place (a desktop, a TV), not for phones carried around.
 """
 
 import datetime
 import os
+from statistics import median
+from collections import defaultdict
 
 from . import meshtest, models
 
@@ -31,6 +40,10 @@ RECENT_EVENTS = 15
 CHOICE_DAYS = 30  # the device picker lists devices seen within this many days
 UTIL_BUSY = 50  # channel utilization (% of airtime in use) from which a channel reads as busy
 UTIL_CONGESTED = 75  # ... and congested: clients on it will notice
+TYPICAL_DAYS = 7  # a device's usual signal per eero and band is the median over this many days
+ROAM_WEAKER_DB = 6  # an eero this much weaker (usual signal) than the one left, or than the best, is "weaker"
+NEARBY_S = 120  # other devices' changes this close to a device's own happened "at the same moment"
+RATE_DROP = 0.5  # a link rate falling to this fraction or less between two polls is reported
 
 
 def _one(db, sql, *args):
@@ -309,7 +322,261 @@ def device_timeline(db, device_id, now, days=7, limit=40):
             out.append({"ts": s["ts"], "kind": "channel",
                         "text": f"Channel {prev['channel']} → {s['channel']} ({s['band']} GHz)", "source": "sample"})
         prev = s
+    for r in roams(db, device_id, since, now, now):  # mark roams to a weaker eero on the event that shows them
+        if not r["weaker"]:
+            continue
+        shown = next((e for e in out if e["kind"] == "roam" and e["ts"] == r["ts"]), None) or next(
+            (e for e in out if e["kind"] == "connect" and abs(e["ts"] - r["ts"]) <= 600
+             and e["text"].startswith(f"Connected to {r['to']}")), None)
+        if shown:
+            shown["text"] += f" · weaker eero (usually {r['from_dbm']} → {r['to_dbm']} dBm)"
+            shown["weaker"] = True
     return sorted(out, key=lambda e: e["ts"], reverse=True)[:limit]
+
+
+def _locations(db):
+    return {str(r["id"]): r["location"] for r in _all(db, "SELECT id, location FROM nodes")}
+
+
+def typical_signal(db, device_id, now, days=TYPICAL_DAYS):
+    """{(node id, band): the device's usual signal in dBm} over the `days` before `now` (see the module docstring)."""
+    good, every = defaultdict(list), defaultdict(list)
+    for s in _all(db, """SELECT node_id, band, signal, snr FROM device_samples WHERE device_id = ? AND ts > ? AND ts <= ?
+            AND node_id IS NOT NULL AND signal IS NOT NULL""", device_id, now - days * 86400, now):
+        every[(s["node_id"], s["band"])].append(s["signal"])
+        if s["snr"]:
+            good[(s["node_id"], s["band"])].append(s["signal"])
+    return {k: round(median(good.get(k) or v)) for k, v in every.items()}
+
+
+def best_eeros(typical):
+    """{band: (usual signal, node id)} of the strongest eero per band, from typical_signal()."""
+    best = {}
+    for (nid, band), dbm in typical.items():
+        if band not in best or dbm > best[band][0]:
+            best[band] = (dbm, nid)
+    return best
+
+
+def roams(db, device_id, lo, hi, now=None):
+    """The device's roams between eeros seen by the polls in [lo, hi], oldest first:
+    [{ts, from, to, band, from_dbm, to_dbm, weaker}] with its usual signal on the eero left and the eero joined
+    (that eero's signal at the roam when it has no usual signal yet). Usual signals are taken up to `now`."""
+    typical = typical_signal(db, device_id, now or hi)
+    loc = _locations(db)
+    out = []
+    for c in _all(db, """SELECT ts, old, new FROM device_changes WHERE device_id = ? AND kind = 'node' AND source = 'poll'
+            AND ts BETWEEN ? AND ? ORDER BY ts""", device_id, lo, hi):
+        new = _one(db, "SELECT node_id, band, signal FROM device_samples WHERE device_id = ? AND ts = ?", device_id, c["ts"])
+        old = _one(db, """SELECT node_id, band, signal FROM device_samples WHERE device_id = ? AND ts < ?
+            ORDER BY ts DESC LIMIT 1""", device_id, c["ts"])
+        nid = lambda x: int(x) if x and str(x).isdigit() else None  # noqa: E731
+        f = typical.get((nid(c["old"]), old.get("band")), old.get("signal"))
+        t = typical.get((nid(c["new"]), new.get("band")), new.get("signal"))
+        out.append({"ts": c["ts"], "from": loc.get(c["old"], c["old"]), "to": loc.get(c["new"], c["new"]),
+                    "band": new.get("band"), "from_dbm": f, "to_dbm": t,
+                    "weaker": f is not None and t is not None and t <= f - ROAM_WEAKER_DB})
+    return out
+
+
+def weaker_eero_seconds(db, device_id, lo, hi, now=None):
+    """Seconds in [lo, hi) the device was connected to an eero usually ROAM_WEAKER_DB or more below its best eero
+    on the same band (usual signals up to `now`)."""
+    typical = typical_signal(db, device_id, now or hi)
+    best = best_eeros(typical)
+    samples = _all(db, "SELECT ts, node_id, band FROM device_samples WHERE device_id = ? AND ts BETWEEN ? AND ? ORDER BY ts",
+                   device_id, lo - meshtest.GAP, hi)
+    secs = 0
+    for a, b, s in meshtest.segments(samples, lo, hi):
+        usual, top = typical.get((s["node_id"], s["band"])), best.get(s["band"])
+        if usual is not None and top and top[1] != s["node_id"] and usual <= top[0] - ROAM_WEAKER_DB:
+            secs += b - a
+    return secs
+
+
+def roam_summary(db, device_id, now, hours=24):
+    """For the device sensors: roams, roams to a weaker eero and minutes on a weaker eero in the last `hours`, and
+    the device's best eero on the band it uses now (or its strongest eero overall)."""
+    lo = now - hours * 3600
+    r = roams(db, device_id, lo, now, now)
+    loc = _locations(db)
+    best = best_eeros(typical_signal(db, device_id, now))
+    band = (_one(db, "SELECT band FROM device_samples WHERE device_id = ? ORDER BY ts DESC LIMIT 1", device_id)
+            .get("band"))
+    top = best.get(band) or max(best.values(), default=None)
+    top_band = band if band in best else next((b for b, v in best.items() if v == top), None)
+    return {"roams": len(r), "weaker_roams": sum(1 for x in r if x["weaker"]),
+            "weaker_minutes": round(weaker_eero_seconds(db, device_id, lo, now, now) / 60),
+            "best_eero": loc.get(str(top[1])) if top else None, "best_band": top_band,
+            "best_dbm": top[0] if top else None}
+
+
+def signal_by(db, device_id, now, days=30):
+    """The device's link per eero, band and channel over the last `days`, most used first:
+    [{node, band, channel, hours, signal, rx_mbps, tx_mbps, retry_pct, last}]. signal is the median, without
+    SNR-0 samples where there are others; rates and retries are means."""
+    loc = _locations(db)
+    samples = _all(db, "SELECT * FROM device_samples WHERE device_id = ? AND ts > ? AND ts <= ? ORDER BY ts",
+                   device_id, now - days * 86400, now)
+    groups = defaultdict(lambda: {"secs": 0, "good": [], "every": [], "rx": [], "tx": [], "retry": [], "last": 0})
+    for a, b, s in meshtest.segments(samples, now - days * 86400, now + meshtest.POLL):
+        g = groups[(s["node_id"], s["band"], s["channel"])]
+        g["secs"] += b - a
+        g["last"] = max(g["last"], s["ts"])
+        if s["signal"] is not None:
+            g["every"].append(s["signal"])
+            if s["snr"]:
+                g["good"].append(s["signal"])
+        for key, col in (("rx", "rx_rate_mbps"), ("tx", "tx_rate_mbps"), ("retry", "tx_retry_pct")):
+            if s[col] is not None:
+                g[key].append(s[col])
+    mean = lambda v: round(sum(v) / len(v)) if v else None  # noqa: E731
+    rows = [{"node": loc.get(str(nid), nid), "band": band, "channel": ch, "hours": round(g["secs"] / 3600, 1),
+             "signal": round(median(g["good"] or g["every"])) if g["every"] else None,
+             "rx_mbps": mean(g["rx"]), "tx_mbps": mean(g["tx"]),
+             "retry_pct": round(sum(g["retry"]) / len(g["retry"]), 1) if g["retry"] else None, "last": g["last"]}
+            for (nid, band, ch), g in groups.items()]
+    return sorted(rows, key=lambda r: -r["hours"])
+
+
+def mesh_changes(db, lo, hi):
+    """What changed in the mesh in [lo, hi], oldest first: [{ts, kind, text}]. meshtest.events() (restarts,
+    firmware, 5/6 GHz channel changes, collector gaps, internet down, eero's status events) plus each satellite's
+    upstream eero changes (kind 'upstream'; band flips on the same eero are left out)."""
+    out = meshtest.events(db, lo, hi)
+    for node in meshtest.satellites(db):
+        prev = None
+        for s in meshtest.node_samples(db, node, lo - meshtest.GAP, hi):
+            if not meshtest.is_valid(s):
+                continue
+            up = meshtest.upstream_of(s)
+            if prev is not None and up != prev and s["ts"] >= lo:
+                now_text = "is wired" if up == "wired" else f"connects through {up}"
+                out.append({"ts": s["ts"], "kind": "upstream", "text": f"{node} now {now_text} (was {prev})"})
+            prev = up
+    return sorted(out, key=lambda e: e["ts"])
+
+
+def _others(db, device_id, lo, hi):
+    """Other devices' connects, disconnects and roams in [lo, hi]: [{ts, device, text, source}]."""
+    loc = _locations(db)
+    names = {r["id"]: device_name(r) for r in _all(db, "SELECT * FROM devices")}
+    out = []
+    for e in _all(db, """SELECT ts_ms / 1000 AS ts, action, device_id, device_name, node_location FROM events
+            WHERE ts_ms BETWEEN ? AND ? AND action IN ('connected', 'disconnected') AND device_id IS NOT ?""",
+                  lo * 1000, hi * 1000, device_id):
+        word = "connected to" if e["action"] == "connected" else "disconnected from"
+        out.append({"ts": e["ts"], "device": names.get(e["device_id"]) or (e["device_name"] or "?").rstrip("."),
+                    "text": f"{word} {e['node_location'] or 'an eero'}", "source": "eero"})
+    for c in _all(db, """SELECT ts, device_id, kind, old, new FROM device_changes WHERE ts BETWEEN ? AND ? AND device_id != ?
+            AND source = 'poll' AND kind IN ('node', 'connected', 'disconnected')""", lo, hi, device_id):
+        text = (f"roamed {loc.get(c['old'], c['old'])} → {loc.get(c['new'], c['new'])}" if c["kind"] == "node"
+                else c["kind"])
+        out.append({"ts": c["ts"], "device": names.get(c["device_id"], str(c["device_id"])), "text": text,
+                    "source": "poll"})
+    return sorted(out, key=lambda e: e["ts"])
+
+
+def incident(db, device_id, at, before=1800, after=1800, now=None):
+    """Everything known around `at` for one device, for the "What happened?" page: the device's polls and
+    events, its usual signal per eero, the mesh (each eero's status, upstreams and busiest channel use), mesh
+    changes, other devices' changes and findings [{ts, level, text}] (level bad, warn or info). None for an
+    unknown device."""
+    d = _one(db, "SELECT * FROM devices WHERE id = ?", device_id)
+    if not d:
+        return None
+    lo, hi = at - before, at + after
+    now = now or hi
+    loc = _locations(db)
+    samples = [{**s, "node": loc.get(str(s["node_id"]), s["node_id"])} for s in _all(
+        db, "SELECT * FROM device_samples WHERE device_id = ? AND ts BETWEEN ? AND ? ORDER BY ts", device_id, lo, hi)]
+    events = [e for e in device_timeline(db, device_id, hi, days=(hi - lo) / 86400, limit=1000) if lo <= e["ts"] <= hi]
+    moves = roams(db, device_id, lo, hi, now)
+    typical = typical_signal(db, device_id, now)
+    usual = sorted(({"node": loc.get(str(nid), nid), "band": band, "dbm": dbm} for (nid, band), dbm in typical.items()),
+                   key=lambda u: (u["band"] or "", -u["dbm"]))
+    nodes = []
+    for n in _all(db, "SELECT * FROM nodes ORDER BY is_gateway DESC, location"):
+        ns = _all(db, "SELECT * FROM node_samples WHERE node_id = ? AND ts BETWEEN ? AND ? ORDER BY ts", n["id"], lo, hi)
+        ups = []
+        for s in ns:
+            u = "wired" if n["is_gateway"] or s.get("connection_type") == "WIRED" else \
+                f"{meshtest.upstream_of(s) or '?'} {meshtest.band_of(s) or '?'} GHz"
+            if not ups or ups[-1] != u:
+                ups.append(u)
+        radios = {}
+        for r in _all(db, "SELECT band, channel, utilization FROM radio_samples WHERE node_id = ? AND ts BETWEEN ? AND ?",
+                      n["id"], lo, hi):
+            x = radios.setdefault(r["band"], {"band": r["band"], "channels": [], "max_util": None})
+            if r["channel"] is not None and r["channel"] not in x["channels"]:
+                x["channels"].append(r["channel"])
+            if r["utilization"] is not None:
+                x["max_util"] = max(x["max_util"] or 0, r["utilization"])
+        nodes.append({"node": n["location"], "samples": len(ns),
+                      "online": all(s.get("status") == "green" and s.get("heartbeat_ok") == 1 for s in ns) if ns else None,
+                      "upstreams": ups, "clients": [min(s["clients"] or 0 for s in ns), max(s["clients"] or 0 for s in ns)]
+                      if ns else None, "radios": sorted(radios.values(), key=lambda r: r["band"])})
+    changes = mesh_changes(db, lo, hi)
+    others = _others(db, device_id, lo, hi)
+    own = [e["ts"] for e in events if e["kind"] in ("connect", "disconnect", "roam")]
+    nearby = [o for o in others if any(abs(o["ts"] - t) <= NEARBY_S for t in own)]
+
+    findings = []
+    for r in moves:
+        text = f"Roamed {r['from']} → {r['to']}"
+        if r["from_dbm"] is not None and r["to_dbm"] is not None:
+            text += f" (usually {r['from_dbm']} → {r['to_dbm']} dBm)"
+        findings.append({"ts": r["ts"], "level": "bad" if r["weaker"] else "info",
+                         "text": text + (": a weaker eero" if r["weaker"] else "")})
+    for e in events:
+        if e["kind"] == "disconnect":
+            findings.append({"ts": e["ts"], "level": "warn", "text": e["text"]})
+    for a, b in zip(samples, samples[1:]):
+        if a["node_id"] != b["node_id"] or b["ts"] - a["ts"] > meshtest.GAP:
+            continue
+        for col, word in (("tx_rate_mbps", "tx"), ("rx_rate_mbps", "rx")):
+            if a[col] and a[col] >= 100 and b[col] is not None and b[col] <= a[col] * RATE_DROP:
+                findings.append({"ts": b["ts"], "level": "warn", "text": f"Link rate ({word}) fell from {a[col]:g} to "
+                                                                          f"{b[col]:g} Mbit/s on {b['node']}"})
+    weak = [s for s in samples if s["snr"] and s["signal"] is not None and s["signal"] < WEAK_SIGNAL_DBM]
+    if weak:
+        w = min(weak, key=lambda s: s["signal"])
+        findings.append({"ts": w["ts"], "level": "warn", "text": f"Weak signal: down to {w['signal']} dBm on {w['node']} "
+                                                                 f"({len(weak)} poll{'s' if len(weak) > 1 else ''} below {WEAK_SIGNAL_DBM})"})
+    secs = weaker_eero_seconds(db, device_id, lo, hi, now)
+    if secs:
+        best = best_eeros(typical)
+        tops = ", ".join(f"{loc.get(str(nid), nid)} {band} GHz ({dbm} dBm)" for band, (dbm, nid) in sorted(best.items()))
+        findings.append({"ts": None, "level": "warn", "text": f"{round(secs / 60)} min on an eero usually "
+                                                              f"{ROAM_WEAKER_DB}+ dB weaker than its best ({tops})"})
+    for c in changes:
+        findings.append({"ts": c["ts"], "level": "bad" if c["kind"] in ("reboot", "internet") else "warn", "text": c["text"]})
+    if not changes:
+        findings.append({"ts": None, "level": "info", "text": "No mesh changes in this window (restarts, firmware, "
+                                                              "channel or upstream changes, collector gaps)"})
+    for n in nodes:
+        if n["online"] is False:
+            findings.append({"ts": None, "level": "bad", "text": f"{n['node']} was not online in every poll"})
+    own_nodes = {s["node"] for s in samples}
+    for n in nodes:
+        if n["node"] not in own_nodes:
+            continue
+        for r in n["radios"]:
+            if r["band"] in {s["band"] for s in samples} and (r["max_util"] or 0) >= UTIL_BUSY:
+                findings.append({"ts": None, "level": "warn", "text": f"{n['node']} {r['band']} GHz channel was "
+                                                                      f"{utilization_level(r['max_util'])} (up to {r['max_util']} %)"})
+    if own and nearby:
+        who = sorted({o["device"] for o in nearby})
+        findings.append({"ts": None, "level": "info", "text": f"{len(who)} other device{'s' if len(who) > 1 else ''} "
+                         f"changed within {NEARBY_S // 60} min of this device's changes: {', '.join(who[:8])}"})
+    elif own:
+        findings.append({"ts": None, "level": "info", "text": f"No other device changed within {NEARBY_S // 60} min of "
+                                                              "this device's changes: this points at its own link, "
+                                                              "not the mesh"})
+    findings.sort(key=lambda f: (f["ts"] is None, f["ts"] or 0))
+    return {"device": {**d, "name": device_name(d)}, "at": at, "from": lo, "to": hi, "samples": samples,
+            "events": sorted(events, key=lambda e: e["ts"]), "roams": moves, "usual": usual, "nodes": nodes,
+            "mesh_changes": changes, "others": others, "nearby": nearby, "findings": findings}
 
 
 def device_table(db, now, tz):

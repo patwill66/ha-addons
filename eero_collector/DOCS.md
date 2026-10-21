@@ -30,10 +30,21 @@ Show them with a Picture entity card; they refresh when new eero data arrives.
 band of that link) and *Direct to gateway (24 h)*. eero often flips the band (5 ↔ 6 GHz) while staying on the same
 eero; those flips are not upstream switches. *Upstream switches* counts changes of eero only.
 
+**Troubleshooting:** the Web UI's *What happened?* page takes a device and a moment (a dropped call, a stalled
+page) and lines up, for a window around it: the device's polls (eero, band, channel, signal, rates), its events,
+its usual signal per eero, each eero's status, upstream and channel use, mesh changes and what other devices did,
+with findings on top (a roam to a weaker eero, a link-rate drop, mesh changes or none, whether other devices
+changed at the same moment). Device pages show roams to a weaker eero, time spent on one, and the signal per eero,
+band and channel over 30 days, which shows what a channel change did to that device. Each tracked device gets
+*Roams to a weaker eero (24 h)*, *Time on a weaker eero (24 h)* and *Best eero* (with the per-channel table as
+attributes). *Last mesh change* on eero Network lists the last 7 days of restarts, firmware and channel changes,
+upstream eero changes, collector gaps and internet outages.
+
 **Mesh Test:** a device for controlled backhaul tests, such as moving an eero or opening a cabinet. Pick a
 *Scenario*, add *Notes*, press *Start test*, and *End test* when done. The first *Stabilization period* minutes
 aren't measured. Results count only valid time: 5-minute samples with a reported upstream; missed polls don't count
-as a connection. A test with fewer valid hours than *Preliminary below* is flagged preliminary, and coverage below
+as a connection. Each test records the 5 and 6 GHz channels it ran on and warns when they differ
+from the baseline's. A test with fewer valid hours than *Preliminary below* is flagged preliminary, and coverage below
 *Coverage warning below* is flagged too. Changing a setting applies to the next test; each test keeps its own.
 *View* chooses what the metric sensors and the *Test chart* image show. *Comparison chart* and *Completed tests*
 (attributes) compare finished tests; the optional historical baseline is shown apart. Latency is Home Assistant's
