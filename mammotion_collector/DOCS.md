@@ -84,15 +84,18 @@ What the data means comes from the collector's `report` module. The pages only l
 
 ## Snapshots
 
-The Web UI's **Download a database snapshot** link downloads a consistent copy of the database (`mammotion-<UTC time>.db`).
-It's made with SQLite's online backup API from a read-only connection, so it includes rows that are still
-in the `-wal` file, and the collector keeps running. The copy is made in the container's temporary storage
-and deleted after it's sent. The response's `X-Snapshot-Sha256` header carries its SHA-256.
+The Web UI's **Download a database snapshot** link downloads a consistent copy of the database,
+gzip-compressed (`mammotion-<UTC time>.db.gz`, about 1/15 the size; `gunzip` it). Plain `/snapshot` sends the
+uncompressed `.db`. Over Nabu Casa, transfers are cut off after about a minute, so use the compressed one there.
+The copy is made with SQLite's online backup API from a read-only connection, so it includes rows that are still
+in the `-wal` file, and the collector keeps running. It's made in the container's temporary storage and deleted
+after it's sent. `X-Snapshot-Sha256` carries the database's SHA-256, and `X-Snapshot-Gzip-Sha256` the compressed
+file's.
 
 The server listens on the ingress port (8099) and only answers Home Assistant's ingress proxy, so every
 download needs a logged-in Home Assistant user (or a token that can open an ingress session). It has no
 credentials of its own and never writes to the database. Outside the UI, open an ingress session through
-the Supervisor API (`POST /ingress/session`) and request `<ingress_url>snapshot` with the
-`ingress_session` cookie.
+the Supervisor API (`POST /ingress/session`) and request `<ingress_url>snapshot?gzip=1` with the
+`ingress_session` cookie (over Nabu Casa, with curl `--http1.1`; Python's urllib gets cut off).
 
 The collector itself is maintained in a separate repository; `SOURCE` records the commit it was built from.

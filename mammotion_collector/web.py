@@ -6,14 +6,18 @@
   GET /incident    "What happened?": a stuck incident (?i=N) or any moment (?at=YYYY-MM-DDTHH:MM&win=min):
                    findings, timeline, state changes, errors and eero readings
   GET /zones       per-zone figures, the zone settings, and each zone's jobs and incidents
-  GET /snapshot    a consistent copy of the database (SQLite online backup from a read-only connection)
+  GET /snapshot    a consistent copy of the database (SQLite online backup from a read-only connection);
+                   ?gzip=1 sends it gzip-compressed (about 1/15 the size), which gets through Nabu Casa
+                   before its cutoff of about a minute
 
 What the data means comes from mammotion-luba's collector.report (jobs, incidents, findings); this
 module only lays it out. Only the Supervisor's ingress proxy may connect: Home Assistant authenticates
 the user, so the server has no credentials. It never writes to the database or calls Mammotion.
 """
 import datetime
+import gzip
 import hashlib
+import shutil
 import html
 import http.server
 import pathlib
@@ -191,7 +195,8 @@ class App:
         body += (f"<h2>Data</h2><p class='muted'>Analysis {self.when(meta['analyzed_at'])} · "
                  f"{meta.get('eero_samples') or 'no'} eero readings · {meta.get('zone_fingerprints')} zone fingerprint(s), "
                  f"{meta.get('zone_labels')} label(s) · times in {e(meta.get('timezone', ''))}</p>"
-                 "<p><a href='snapshot'>Download a database snapshot</a> (a consistent copy, made while the collector keeps running).</p>")
+                 "<p><a href='snapshot?gzip=1'>Download a database snapshot</a> (a consistent copy, made while the collector "
+                 "keeps running; gzip-compressed, <code>gunzip</code> it to get the .db file).</p>")
         return page("LUBA mower", body)
 
     def job_table(self, jobs, sortable=False):
@@ -388,6 +393,14 @@ class App:
         return page("Zones", body)
 
 
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def make_handler(app, dev=False):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "MammotionCollector"
@@ -414,7 +427,7 @@ def make_handler(app, dev=False):
                 elif path == "/zones":
                     self.reply(app.zones())
                 elif path == "/snapshot":
-                    self.snapshot()
+                    self.snapshot(compress=q.get("gzip", [""])[0] == "1")
                 else:
                     self.send_error(404)
             except Exception as err:  # a page error must never take the add-on down
@@ -429,7 +442,9 @@ def make_handler(app, dev=False):
             self.end_headers()
             self.wfile.write(body)
 
-        def snapshot(self):
+        def snapshot(self, compress=False):
+            """X-Snapshot-Sha256 is always the database's own SHA-256; a compressed download adds
+            X-Snapshot-Gzip-Sha256 for the file as sent."""
             stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             with app.snapshot_lock, tempfile.TemporaryDirectory(prefix="snapshot-") as tmp:
                 copy = pathlib.Path(tmp) / "mammotion.db"
@@ -445,21 +460,25 @@ def make_handler(app, dev=False):
                     app.log(f"snapshot failed: {err}")
                     self.send_error(500, "snapshot failed")
                     return
-                digest = hashlib.sha256()
-                with copy.open("rb") as f:
-                    for block in iter(lambda: f.read(CHUNK), b""):
-                        digest.update(block)
-                size = copy.stat().st_size
+                digest = sha256(copy)
+                sent, name, kind = copy, f"mammotion-{stamp}.db", "application/vnd.sqlite3"
+                if compress:
+                    sent, name, kind = copy.with_suffix(".db.gz"), name + ".gz", "application/gzip"
+                    with copy.open("rb") as f, gzip.open(sent, "wb", compresslevel=6) as g:
+                        shutil.copyfileobj(f, g, 1 << 20)
+                size = sent.stat().st_size
                 self.send_response(200)
-                self.send_header("Content-Type", "application/vnd.sqlite3")
+                self.send_header("Content-Type", kind)
                 self.send_header("Content-Length", str(size))
-                self.send_header("Content-Disposition", f'attachment; filename="mammotion-{stamp}.db"')
-                self.send_header("X-Snapshot-Sha256", digest.hexdigest())
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                self.send_header("X-Snapshot-Sha256", digest)
+                if compress:
+                    self.send_header("X-Snapshot-Gzip-Sha256", sha256(sent))
                 self.end_headers()
-                with copy.open("rb") as f:
+                with sent.open("rb") as f:
                     for block in iter(lambda: f.read(CHUNK), b""):
                         self.wfile.write(block)
-            app.log(f"served snapshot ({size // 1024} KB)")
+            app.log(f"served snapshot ({size // 1024} KB{', gzip' if compress else ''})")
 
     return Handler
 

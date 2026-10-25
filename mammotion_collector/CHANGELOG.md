@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.7.1 (2026-10-25)
+- **Compressed snapshots:** `/snapshot?gzip=1` sends the database gzip-compressed (31 MB → about 2 MB). Over Nabu Casa, transfers are cut off after about a minute, which the uncompressed copy no longer fit in. `X-Snapshot-Sha256` is still the database's own checksum, and `X-Snapshot-Gzip-Sha256` is added for the compressed file. The Web UI's download link uses it; plain `/snapshot` still works.
+
 ## 0.7.0 (2026-10-25)
 - **Web UI pages** (Open Web UI):
   - **Overview**
