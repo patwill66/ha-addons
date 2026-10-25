@@ -12,8 +12,15 @@ or /share/mammotion/mammotion.db (a copy of the Mac collector's database). Stop 
 (scripts/service.sh stop) before copying it: only one collector may hold the Mammotion credentials.
 
 Unless `publish_sensors` is off, publish.py runs alongside it in a thread and mirrors what has been
-logged into sensor.luba_* states in Home Assistant, for the "LUBA Mower" dashboard. snapshot_server.py
-runs in another thread and serves read-only database snapshots through ingress.
+logged into sensor.luba_* states in Home Assistant, for the "LUBA Mower" dashboard, including the
+analysis (jobs, zones, reliability, battery) from collector.report; hastats.py imports the daily
+history into HA's long-term statistics once an hour. snapshot_server.py runs in another thread and
+serves read-only database snapshots through ingress.
+
+Zones: the options `eero_device`, `zone_fingerprints` and `zone_labels` become /data/zones.json (the
+format collector.report reads). Label times without a UTC offset are read in `timezone`. They stay in
+the add-on's options, never in this public code. `eero_database` is the eero Collector's database,
+read-only.
 
 The collector is restarted after a crash (60 s later, like launchd's ThrottleInterval), but not after
 a clean stop, missing or refused credentials (exit 2) or "already running" (exit 75).
@@ -28,11 +35,15 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
+import hastats
 import publish
 import snapshot_server
 
 OPTIONS = pathlib.Path("/data/options.json")
+ZONES = pathlib.Path("/data/zones.json")
 DB_DIR = pathlib.Path("/share/mammotion_collector")
 DB = DB_DIR / "mammotion.db"
 SOURCES = (pathlib.Path("/data/mammotion.db"), pathlib.Path("/share/mammotion/mammotion.db"))
@@ -76,6 +87,24 @@ def restore_db():
     log(f"restored {DB} ({DB.stat().st_size // 1024} KB) from {source}")
 
 
+def write_zones(options, tz, path=ZONES):
+    """Writes the zones file from the options; returns how many labels were skipped as unreadable."""
+    labels, skipped = {}, 0
+    for label in options.get("zone_labels") or []:
+        try:
+            at = datetime.fromisoformat(str(label["start"]).strip().replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            skipped += 1
+            continue
+        at = at if at.tzinfo else at.replace(tzinfo=ZoneInfo(tz))
+        labels[at.astimezone(timezone.utc).isoformat(timespec="seconds")] = label["zone"]
+    fingerprints = [{"node": f["node"], "band": str(f["band"]), "zone": f["zone"]}
+                    for f in options.get("zone_fingerprints") or []]
+    path.write_text(json.dumps({"eero_device": options.get("eero_device") or None,
+                                "fingerprints": fingerprints, "labels": labels}))
+    return skipped
+
+
 def main():
     options = json.loads(OPTIONS.read_text())
     env = dict(os.environ,
@@ -92,8 +121,18 @@ def main():
     stopping = False
     stop_publishing = threading.Event()
     if options.get("publish_sensors", True):
+        tz = options.get("timezone") or "America/Chicago"
+        skipped = write_zones(options, tz)
+        log(f"analysis: time zone {tz}, {len(options.get('zone_fingerprints') or [])} zone fingerprint(s), "
+            f"{len(options.get('zone_labels') or []) - skipped} label(s)"
+            + (f", {skipped} unreadable label time(s) skipped" if skipped else ""))
+        analysis = publish.Analysis(str(DB), tz, str(ZONES), options.get("eero_database") or None)
         threading.Thread(target=publish.run, daemon=True,
-                         args=(str(DB), int(options.get("poll_seconds", 30)), stop_publishing, log)).start()
+                         args=(str(DB), int(options.get("poll_seconds", 30)), stop_publishing, log, analysis)).start()
+        token = publish.supervisor_token()
+        if token:
+            importer = hastats.Importer(token, str(DB), lambda: (analysis.get()[0], analysis.tz), log)
+            threading.Thread(target=importer.run, daemon=True, args=(stop_publishing,)).start()
     threading.Thread(target=snapshot_server.run, daemon=True, args=(str(DB), log)).start()
 
     def forward(signum, _frame):

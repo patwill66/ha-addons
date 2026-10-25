@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0 (2026-10-25)
+- **Analysis sensors** from the collector's new `report` module (mammotion-luba, phase 1):
+  - current and last job, with zone and outcome
+  - job completion rate (30 days), stuck incidents (7 days) and the last one
+  - mowing hours (7 days), hours powered off in the yard (30 days), faults (7 days)
+  - battery drain and charging rates, mowing time per charge
+  - zones, job history, stuck-incident history and daily history
+
+  See DOCS.
+- **Long-term statistics:** the daily history goes into Home Assistant's statistics once an hour (`mammotion_collector:*`), backfilled to 2026-10-07.
+- **New options:** `timezone`, `eero_database`, `eero_device`, `zone_fingerprints` and `zone_labels`. Zones come from your labels, or from the eero node and band the mower used while mowing (read from the eero Collector's database). Without them, jobs show no zone and everything else still works.
+- The image now includes `tzdata`.
+
 ## 0.5.0 (2026-10-25)
 - Collector **derivation v3** (mammotion-luba `f27482e`). On the first start the collector rebuilds all state events and sessions, logging "Derivation rules changed (now v3)". Telemetry isn't touched.
 - New mower states for `sensor.luba_condition`: `mapping` ("Recording a map") and `idle_off_dock` ("Idle, off the dock"). Both used to show as "Unknown state".

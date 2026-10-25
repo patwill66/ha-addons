@@ -13,7 +13,14 @@ sessions.
 | `client_id`, `client_secret` | Credentials from the Mammotion Developer portal |
 | `poll_seconds` | Poll interval (default 30) |
 | `verbose` | Log every poll |
-| `publish_sensors` | Mirror what was logged into `sensor.luba_*` / `binary_sensor.luba_*` states |
+| `publish_sensors` | Mirror what was logged into `sensor.luba_*` / `binary_sensor.luba_*` states, plus the analysis and long-term statistics below |
+| `timezone` | Time zone for local days and for label times given without a UTC offset (default `America/Chicago`) |
+| `eero_database` | The eero Collector's database, read-only (default `/share/eero_collector/eero.db`) |
+| `eero_device` | The mower's name in eero. With it, a job's zone and a stuck incident's location come from the eero node and band the mower used. |
+| `zone_fingerprints` | eero node and band → zone, for example `{node: Living Room, band: "2.4", zone: Front Yard}`. Leave out a node and band that several zones share. |
+| `zone_labels` | Zones you know: the job's start time and zone, for example `{start: "2026-10-24T10:54", zone: Front Yard}`. A label wins over eero. |
+
+Zone settings live only in these options (written to `/data/zones.json` at start), never in the add-on's code.
 
 Mammotion allows only **two live tokens per client**, and a third login revokes the oldest. Run only one
 collector with these credentials. A lock file next to the database stops two installs of this add-on
@@ -33,6 +40,30 @@ from collecting at once.
   samples on its next start. The log then says "Derivation rules changed".
 - The sensors are set through the Home Assistant API. They have no unique ID, and after a Home
   Assistant restart they come back on the next poll.
+
+## Analysis
+
+The collector's `report` module turns the history into jobs (sessions joined by `visualHashs`, with
+zone, mowing and stuck time, battery drain, incidents and outcome), stuck incidents (what followed and,
+with eero, roughly where), daily rollups in `timezone`, and battery rates. It runs at most every 5
+minutes and publishes:
+
+| Entity | State |
+|---|---|
+| `sensor.luba_current_job`, `sensor.luba_last_job` | The current job's zone (or `none`); the last finished job's outcome. Attributes: the job's details |
+| `sensor.luba_completion_rate_30d` | % of jobs finished in 30 days that completed (attributes: 7- and 30-day figures) |
+| `sensor.luba_stuck_incidents_7d`, `sensor.luba_last_stuck` | Stuck incidents in 7 days; when the last one started (attributes: its details) |
+| `sensor.luba_mowing_hours_7d`, `sensor.luba_off_in_yard_hours_30d` | Hours mowing; hours powered off in the yard after getting stuck |
+| `sensor.luba_faults_7d` | Error records that are faults (not routine, schedule or weather notices); attributes by category |
+| `sensor.luba_drain_rate`, `sensor.luba_charge_rate`, `sensor.luba_mowing_minutes_per_charge` | 30-day median battery rates |
+| `sensor.luba_zones`, `sensor.luba_job_history`, `sensor.luba_incident_history`, `sensor.luba_daily` | Per-zone figures, the last 15 jobs and incidents, the last 14 complete days (attributes) |
+| `sensor.luba_analysis` | When the analysis last ran; eero samples used, zones configured, or the error |
+
+**Long-term statistics:** once an hour, the daily history is imported as external statistics
+`mammotion_collector:<key>`, one row per local day since collection began: `mowing_hours`,
+`mowing_hours_<zone>`, `stuck_hours`, `off_in_yard_hours`, `stuck_incidents`, `jobs_started`,
+`jobs_completed`, `mowing_battery_used`, `offline_blips`, `cellular_hours` (running sums; use the
+"change" statistic), and `drain_rate`, `charge_rate` (daily means). Show them with Statistics graph cards.
 
 ## Snapshots
 

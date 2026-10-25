@@ -5,27 +5,36 @@
   python3 scripts/inspect_db.py recent [-n 20]
   python3 scripts/inspect_db.py events [-n 20]
   python3 scripts/inspect_db.py mowing-sessions [-n 20]
-  python3 scripts/inspect_db.py jobs [-n 20]               # mowing sessions grouped into jobs, with outcome
+  python3 scripts/inspect_db.py jobs [-n 20]               # sessions grouped into jobs: zone, outcome, details
   python3 scripts/inspect_db.py charging-sessions [-n 20]
   python3 scripts/inspect_db.py errors [-n 20]
   python3 scripts/inspect_db.py tasks
   python3 scripts/inspect_db.py work-params [-n 5]
   python3 scripts/inspect_db.py runs [-n 10]
   python3 scripts/inspect_db.py incidents          # periods paused off the dock (stuck), with faults
+  python3 scripts/inspect_db.py daily [-n 14]      # one row per local day
+  python3 scripts/inspect_db.py battery [-n 20]    # mowing drain and charging rates per run
+
+jobs, incidents, daily and battery use collector/report.py. Options: --tz (default MAMMOTION_TZ or
+UTC), --zones (default MAMMOTION_ZONES_PATH or data/zones.json), --eero-db (default
+MAMMOTION_EERO_DB; the eero collector's database, for zones and incident locations).
   python3 scripts/inspect_db.py rebuild           # recompute events + sessions from telemetry (writes)
 """
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from collector.config import Settings, mask, seconds_between  # noqa: E402
-from collector.derive import ATTENTION_STATES, error_category, mowing_jobs, operational_state  # noqa: E402
+from collector import report  # noqa: E402
+from collector.config import Settings, mask  # noqa: E402
+from collector.derive import ATTENTION_STATES, error_category, operational_state  # noqa: E402
 
 
 def table(rows, cols):
@@ -47,9 +56,13 @@ def mins(seconds):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["status", "recent", "events", "mowing-sessions", "jobs", "charging-sessions",
-                                        "errors", "tasks", "work-params", "runs", "incidents", "rebuild", "rebuild-sessions"])
+                                        "errors", "tasks", "work-params", "runs", "incidents", "daily", "battery",
+                                        "rebuild", "rebuild-sessions"])
     ap.add_argument("-n", type=int, default=20, help="rows to show")
     ap.add_argument("--db", help="database path (default MAMMOTION_DB_PATH or data/mammotion.db)")
+    ap.add_argument("--tz", default=os.environ.get("MAMMOTION_TZ", "UTC"), help="time zone for daily rows and job times")
+    ap.add_argument("--zones", help="zones file (default MAMMOTION_ZONES_PATH or data/zones.json)")
+    ap.add_argument("--eero-db", default=os.environ.get("MAMMOTION_EERO_DB"), help="eero collector database (read-only)")
     args = ap.parse_args()
     path = Path(args.db) if args.db else Settings.from_env().db_path
     if not path.exists():
@@ -69,6 +82,19 @@ def main() -> int:
     conn.row_factory = sqlite3.Row
     q = lambda sql, *p: conn.execute(sql, p).fetchall()  # noqa: E731
     n = args.n
+    tz = timezone.utc if args.tz.upper() == "UTC" else ZoneInfo(args.tz)
+    local = lambda ts: ts and report._at(ts).astimezone(tz).strftime("%m-%d %H:%M")  # noqa: E731
+
+    def analysis():
+        zones = report.load_zones(args.zones)
+        out = []
+        for d in q("SELECT id FROM devices"):
+            data = report.load(conn, d["id"])
+            eero = None
+            if args.eero_db and zones.get("eero_device"):
+                eero = report.load_eero_samples(args.eero_db, zones["eero_device"])
+            out.append(report.analyze(data, eero, zones, tz))
+        return out
 
     if args.command == "status":
         print(f"Database: {path.name} (schema v{conn.execute('PRAGMA user_version').fetchone()[0]})")
@@ -118,22 +144,20 @@ def main() -> int:
                            "lowest_battery", "pause_count", "end_status", "end_reason", "errors", "uncertain",
                            "why_uncertain"])
     elif args.command == "jobs":
-        for d in q("SELECT id FROM devices"):
-            latest_real = q("SELECT * FROM telemetry_samples WHERE device_id=? AND raw_status IS NOT NULL"
-                            " ORDER BY observed_at DESC, id DESC LIMIT 1", d["id"])
-            jobs = mowing_jobs(q("SELECT * FROM mowing_sessions WHERE device_id=? ORDER BY started_at", d["id"]),
-                               q("SELECT observed_at, raw_json FROM work_parameter_snapshots WHERE device_id=?", d["id"]),
-                               latest_real[0] if latest_real else None)
-            rows = [j | {"minutes": mins(j["session_seconds"]), "session_ids": ",".join(map(str, j["session_ids"])),
-                         "grouped_by": "inferred" if j["inferred"] else "visual hash", "uncertain": int(j["uncertain"])}
+        for a in analysis():
+            jobs = a["jobs"]
+            rows = [j | {"start": local(j["started_at"]), "end": local(j["ended_at"]),
+                         "zone": f"{j['zone']} ({j['zone_source']})" if j["zone"] else
+                         (f"? {j['eero_zone']} {j['eero_zone_share']}" if j["eero_zone"] else "-"),
+                         "sessions": len(j["session_ids"]),
+                         "errors": ", ".join(f"{k} {v}" for k, v in sorted(j["error_categories"].items()))}
                     for j in jobs[-n:]]
-            table(rows, ["job", "started_at", "ended_at", "minutes", "session_ids", "recharges", "battery_used",
-                         "off_dock_pauses", "outcome", "grouped_by", "uncertain"])
+            table(rows, ["job", "start", "end", "zone", "sessions", "mowing_minutes", "stuck_minutes", "battery_used",
+                         "drain_pct_per_min", "incidents", "powered_off_minutes", "outcome", "errors"])
             done = [j for j in jobs if j["outcome"] not in ("in_progress", "pending")]
             if done:
                 ok = sum(j["outcome"] == "completed" for j in done)
-                print(f"\n  {ok} of {len(done)} finished jobs completed; "
-                      f"{sum(j['off_dock_pauses'] > 0 for j in done)} had off-dock pauses (stuck)")
+                print(f"\n  {ok} of {len(done)} finished jobs completed; {sum(j['incidents'] > 0 for j in done)} had stuck incidents")
     elif args.command == "charging-sessions":
         rows = [dict(r) | {"minutes": mins(r["elapsed_seconds"]),
                            "why_uncertain": "; ".join(json.loads(r["uncertain_reasons"] or "[]"))}
@@ -163,30 +187,30 @@ def main() -> int:
               ["observed_at", "reason", "knife_height", "speed", "channel_width", "channel_mode", "job_content",
                "edge_mode", "toward_mode", "toward_included_angle", "ultra_wave", "forbidden_area_circle_times"])
     elif args.command == "incidents":
-        incidents, cur, prev_state = [], None, None
-        for s in q("SELECT * FROM telemetry_samples ORDER BY observed_at, id"):
-            st = operational_state(s)
-            if st == "no_data":
-                continue
-            if st in ATTENTION_STATES:
-                if cur is None:
-                    cur = {"started_at": s["observed_at"], "start_battery": s["battery_level"], "before": prev_state}
-                cur.update(last_seen=s["observed_at"], end_battery=s["battery_level"])
-            elif cur is not None:
-                cur["then"] = st
-                incidents.append(cur)
-                cur = None
-            prev_state = st
-        if cur is not None:
-            cur["then"] = "(still in progress)"
-            incidents.append(cur)
-        for i in incidents:
-            i["minutes"] = mins(seconds_between(i["started_at"], i["last_seen"]))
-            lo = (datetime.fromisoformat(i["started_at"]) - timedelta(minutes=10)).isoformat(timespec="seconds")
-            hi = (datetime.fromisoformat(i["last_seen"]) + timedelta(minutes=10)).isoformat(timespec="seconds")
-            i["faults"] = ", ".join(str(r["code"]) for r in q(
-                "SELECT code FROM error_events WHERE occurred_at BETWEEN ? AND ? ORDER BY gmt_create_ms", lo, hi)) or "-"
-        table(incidents, ["started_at", "last_seen", "minutes", "before", "start_battery", "end_battery", "then", "faults"])
+        for a in analysis():
+            rows = [i | {"start": local(i["started_at"]), "faults": ", ".join(map(str, i["faults"])) or "-",
+                         "then": "(still in progress)" if i["ongoing"] else i["then"],
+                         "where": f"{i['eero_node']} {i['eero_band']} GHz {i['eero_signal']} dBm" if i.get("eero_node") else "-"}
+                    for i in a["incidents"][-n:]]
+            table(rows, ["start", "minutes", "before", "start_battery", "end_battery", "then", "offline_minutes",
+                         "back_as", "faults", "where"])
+    elif args.command == "daily":
+        for a in analysis():
+            rows = [d | {"mowing": round(d["minutes"].get("mowing", 0)),
+                         "stuck": round(d["minutes"].get("paused_off_dock", 0)),
+                         "off_in_yard": round(d["minutes"].get("stuck_powered_off", 0)),
+                         "offline": round(d["minutes"].get("offline", 0)),
+                         "errors": ", ".join(f"{k} {v}" for k, v in sorted(d["errors"].items()))}
+                    for d in a["daily"][-n:]]
+            table(rows, ["day", "mowing", "stuck", "off_in_yard", "offline", "jobs_started", "jobs_completed", "incidents",
+                         "mowing_battery_used", "drain_pct_per_min", "charge_pct_per_min", "top_ups", "offline_blips",
+                         "cellular_minutes", "wifi_median_mowing", "errors"])
+    elif args.command == "battery":
+        for a in analysis():
+            for kind, label in (("drain", "Mowing runs (drain)"), ("charge", "Charging runs (gain)")):
+                print(f"\n  {label}:")
+                table([r | {"start": local(r["started_at"])} for r in a["battery"][kind][-n:]],
+                      ["start", "minutes", "from", "to", "pct_per_min"])
     elif args.command == "runs":
         table(q("SELECT * FROM collector_runs ORDER BY id DESC LIMIT ?", n)[::-1],
               ["id", "started_at", "ended_at", "poll_seconds", "auth_count", "polls_ok", "polls_failed", "stop_reason"])
