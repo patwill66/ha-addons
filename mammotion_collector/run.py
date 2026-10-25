@@ -14,8 +14,9 @@ or /share/mammotion/mammotion.db (a copy of the Mac collector's database). Stop 
 Unless `publish_sensors` is off, publish.py runs alongside it in a thread and mirrors what has been
 logged into sensor.luba_* states in Home Assistant, for the "LUBA Mower" dashboard, including the
 analysis (jobs, zones, reliability, battery) from collector.report; hastats.py imports the daily
-history into HA's long-term statistics once an hour. snapshot_server.py runs in another thread and
-serves read-only database snapshots through ingress.
+history into HA's long-term statistics once an hour. web.py runs in another thread and serves the
+ingress pages (jobs, a job's timeline, "What happened?" for stuck incidents, zones) and read-only
+database snapshots.
 
 Zones: the options `eero_device`, `zone_fingerprints` and `zone_labels` become /data/zones.json (the
 format collector.report reads). Label times without a UTC offset are read in `timezone`. They stay in
@@ -40,7 +41,7 @@ from zoneinfo import ZoneInfo
 
 import hastats
 import publish
-import snapshot_server
+import web
 
 OPTIONS = pathlib.Path("/data/options.json")
 ZONES = pathlib.Path("/data/zones.json")
@@ -120,20 +121,20 @@ def main():
     child = None
     stopping = False
     stop_publishing = threading.Event()
+    tz = options.get("timezone") or "America/Chicago"
+    skipped = write_zones(options, tz)
+    log(f"analysis: time zone {tz}, {len(options.get('zone_fingerprints') or [])} zone fingerprint(s), "
+        f"{len(options.get('zone_labels') or []) - skipped} label(s)"
+        + (f", {skipped} unreadable label time(s) skipped" if skipped else ""))
+    analysis = publish.Analysis(str(DB), tz, str(ZONES), options.get("eero_database") or None)
     if options.get("publish_sensors", True):
-        tz = options.get("timezone") or "America/Chicago"
-        skipped = write_zones(options, tz)
-        log(f"analysis: time zone {tz}, {len(options.get('zone_fingerprints') or [])} zone fingerprint(s), "
-            f"{len(options.get('zone_labels') or []) - skipped} label(s)"
-            + (f", {skipped} unreadable label time(s) skipped" if skipped else ""))
-        analysis = publish.Analysis(str(DB), tz, str(ZONES), options.get("eero_database") or None)
         threading.Thread(target=publish.run, daemon=True,
                          args=(str(DB), int(options.get("poll_seconds", 30)), stop_publishing, log, analysis)).start()
         token = publish.supervisor_token()
         if token:
             importer = hastats.Importer(token, str(DB), lambda: (analysis.get()[0], analysis.tz), log)
             threading.Thread(target=importer.run, daemon=True, args=(stop_publishing,)).start()
-    threading.Thread(target=snapshot_server.run, daemon=True, args=(str(DB), log)).start()
+    threading.Thread(target=web.run, daemon=True, args=(str(DB), analysis, log)).start()
 
     def forward(signum, _frame):
         nonlocal stopping

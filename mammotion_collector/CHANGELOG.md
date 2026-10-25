@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0 (2026-10-25)
+- **Web UI pages** (Open Web UI):
+  - **Overview**
+  - **Jobs**, with a page per job: a timeline of state, battery, Wi-Fi and eero node, plus its sessions, stuck incidents and errors
+  - **What happened?**, for a stuck incident or any moment: findings first (freed or powered off, how it came back, same spot as other incidents), then the timeline, state changes, errors and eero readings
+  - **Zones**
+- The snapshot download is unchanged (`/snapshot`). `web.py` replaces `snapshot_server.py`.
+- The example in DOCS no longer uses a real room name.
+
 ## 0.6.0 (2026-10-25)
 - **Analysis sensors** from the collector's new `report` module (mammotion-luba, phase 1):
   - current and last job, with zone and outcome

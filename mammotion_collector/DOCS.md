@@ -17,7 +17,7 @@ sessions.
 | `timezone` | Time zone for local days and for label times given without a UTC offset (default `America/Chicago`) |
 | `eero_database` | The eero Collector's database, read-only (default `/share/eero_collector/eero.db`) |
 | `eero_device` | The mower's name in eero. With it, a job's zone and a stuck incident's location come from the eero node and band the mower used. |
-| `zone_fingerprints` | eero node and band → zone, for example `{node: Living Room, band: "2.4", zone: Front Yard}`. Leave out a node and band that several zones share. |
+| `zone_fingerprints` | eero node and band → zone, for example `{node: Hallway, band: "2.4", zone: Front Yard}`. Leave out a node and band that several zones share. |
 | `zone_labels` | Zones you know: the job's start time and zone, for example `{start: "2026-10-24T10:54", zone: Front Yard}`. A label wins over eero. |
 
 Zone settings live only in these options (written to `/data/zones.json` at start), never in the add-on's code.
@@ -65,9 +65,26 @@ minutes and publishes:
 `jobs_completed`, `mowing_battery_used`, `offline_blips`, `cellular_hours` (running sums; use the
 "change" statistic), and `drain_rate`, `charge_rate` (daily means). Show them with Statistics graph cards.
 
+## Web UI
+
+**Open Web UI** (or the sidebar, if you turn on "Show in sidebar") has these pages:
+- **Overview:** the last 7 and 30 days, recent jobs and stuck incidents, and the snapshot link.
+- **Jobs:** every job (sortable, searchable). A job's page shows its timeline on one time axis: state, battery, Wi-Fi and, with eero data, the eero node and band the mower used. Below that come its sessions, stuck incidents and error records.
+- **What happened?:** pick a stuck incident, or any moment and a window. Findings come first:
+  - what it was doing and its battery
+  - how fast it drained
+  - whether it freed itself or powered off, and how it came back
+  - whether it was at the same spot as other incidents (same eero node and band, signal within 6 dB)
+  - its place in the zone's history
+
+  Then the timeline, state changes, error records and eero readings.
+- **Zones:** per-zone figures, each zone's jobs and incidents, and the zone settings.
+
+What the data means comes from the collector's `report` module. The pages only lay it out.
+
 ## Snapshots
 
-**Open Web UI** shows a link that downloads a consistent copy of the database (`mammotion-<UTC time>.db`).
+The Web UI's **Download a database snapshot** link downloads a consistent copy of the database (`mammotion-<UTC time>.db`).
 It's made with SQLite's online backup API from a read-only connection, so it includes rows that are still
 in the `-wal` file, and the collector keeps running. The copy is made in the container's temporary storage
 and deleted after it's sent. The response's `X-Snapshot-Sha256` header carries its SHA-256.

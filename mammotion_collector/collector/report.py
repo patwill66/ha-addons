@@ -318,6 +318,112 @@ def analyze(data: dict, eero_rows=None, zones=None, tz=timezone.utc) -> dict:
     }
 
 
+# --- pages: a window of history, and findings for a stuck incident ------------------------------
+SAMPLE_COLUMNS = "id, observed_at, online, raw_status, charge_status, battery_level, used_network, wifi_rssi"
+SAME_SPOT_DB = 6  # incidents at the same eero node and band within this many dB count as the same spot
+
+BEFORE_WORDS = {"mowing": "mowing", "returning": "heading home to the dock"}
+THEN_WORDS = {"returning": "it headed home", "mowing": "it carried on mowing", "paused_off_dock": "it stayed stuck"}
+BACK_WORDS = {"returning": "it came back on in the yard and drove home (powered on there)",
+              "paused_off_dock": "it came back on in the yard, still stuck",
+              "mowing": "it came back on and carried on mowing (restarted in place)",
+              "docked_charging": "it came back on already on the dock (carried there)",
+              "docked_charged": "it came back on already on the dock (carried there)",
+              "docked_waiting": "it came back on already on the dock (carried there)"}
+
+
+def load_window(conn, device_id: int, start: str, end: str) -> dict:
+    """Samples from start to end, plus the last sample with state before start (so the window's first
+    state is known), and the state events and error records in the window."""
+    q = lambda sql, *a: conn.execute(sql, (device_id, *a)).fetchall()  # noqa: E731
+    before = q(f"SELECT {SAMPLE_COLUMNS} FROM telemetry_samples WHERE device_id=? AND observed_at < ?"
+               " AND raw_status IS NOT NULL ORDER BY observed_at DESC, id DESC LIMIT 1", start)
+    return {
+        "start": start, "end": end,
+        "samples": list(before) + list(q(f"SELECT {SAMPLE_COLUMNS} FROM telemetry_samples WHERE device_id=?"
+                                         " AND observed_at BETWEEN ? AND ? ORDER BY observed_at, id", start, end)),
+        "events": q("SELECT observed_at, event_type, old_value, new_value FROM state_events WHERE device_id=?"
+                    " AND observed_at BETWEEN ? AND ? ORDER BY observed_at, id", start, end),
+        "errors": q("SELECT code, implication, occurred_at FROM error_events WHERE device_id=?"
+                    " AND occurred_at BETWEEN ? AND ? ORDER BY gmt_create_ms", start, end),
+    }
+
+
+def window_view(win: dict, eero=None) -> dict:
+    """load_window() as chart-ready data: `points` (time, state, battery, Wi-Fi), `segments` (runs of
+    one state, clipped to the window), errors with their category, and the eero samples."""
+    start, end = win["start"], win["end"]
+    points = [{"at": max(s["observed_at"], start), "state": st, "battery": s["battery_level"], "wifi": s["wifi_rssi"]}
+              for s, st, _ in timeline(win["samples"])]
+    segments = []
+    for p in points:
+        if segments and segments[-1]["state"] == p["state"]:
+            continue
+        if segments:
+            segments[-1]["end"] = p["at"]
+        segments.append({"state": p["state"], "start": p["at"], "end": end})
+    return {"start": start, "end": end, "points": points, "segments": segments,
+            "events": [dict(e) for e in win["events"]],
+            "errors": [dict(e) | {"category": error_category(e["code"])} for e in win["errors"]],
+            "eero": list(eero.within([(start, end)])) if eero is not None else None}
+
+
+def _when(minutes):
+    return f"{minutes:.0f} min" if minutes < 90 else f"{minutes / 60:.1f} h"
+
+
+def incident_findings(incidents, index: int, jobs=()) -> list[dict]:
+    """What happened in incidents[index], as findings {level: bad|warn|ok|info, at, text}: what it was
+    doing, how fast it drained, how it ended, whether it was at the same spot (eero node, band and
+    signal within SAME_SPOT_DB) as other incidents, and its place in the zone's history."""
+    inc = incidents[index]
+    job = next((j for j in jobs if j["started_at"] <= inc["started_at"] <= (j["ended_at"] or "9999")), None)
+    zone = job["zone"] if job else None
+    out = [{"level": "bad", "at": inc["started_at"],
+            "text": f"Got stuck while {BEFORE_WORDS.get(inc['before'], inc['before'] or 'in an unknown state')}"
+                    f" at {inc['start_battery']} %" + (f", in the {zone}" if zone else "")
+                    + (f" (job {job['job']})" if job else "")}]
+    drop = (inc["start_battery"] or 0) - (inc["end_battery"] or 0)
+    if inc["minutes"] >= 10 and drop > 0:
+        out.append({"level": "info", "at": None,
+                    "text": f"Drained {drop} % in {_when(inc['minutes'])} while stuck (1 % every {inc['minutes'] / drop:.0f} min)"})
+    if inc["ongoing"]:
+        out.append({"level": "bad", "at": inc["last_seen"],
+                    "text": "Powered off and not back yet" if inc["powered_off"] else "Still stuck at the last sample"})
+    elif not inc["powered_off"]:
+        out.append({"level": "ok", "at": inc["last_seen"],
+                    "text": f"Freed after {_when(inc['minutes'])}: {THEN_WORDS.get(inc['then'], inc['then'])}"})
+    else:
+        out.append({"level": "bad", "at": inc["last_seen"],
+                    "text": f"Powered itself off after {_when(inc['minutes'])} stuck, at {inc['end_battery']} %"})
+        if inc["back_as"]:
+            out.append({"level": "warn", "at": inc["back_at"],
+                        "text": f"{_when(inc['offline_minutes'])} later, {BACK_WORDS.get(inc['back_as'], inc['back_as'])}"})
+    if inc.get("eero_node"):
+        def same(o):
+            return (o.get("eero_node"), o.get("eero_band")) == (inc["eero_node"], inc["eero_band"]) and \
+                o.get("eero_signal") is not None and inc["eero_signal"] is not None and \
+                abs(o["eero_signal"] - inc["eero_signal"]) <= SAME_SPOT_DB
+        earlier = [o for o in incidents[:index] if same(o)]
+        later = [o for o in incidents[index + 1:] if same(o)]
+        where = f"{inc['eero_node']} eero, {inc['eero_band']} GHz, {inc['eero_signal']} dBm"
+        if earlier or later:
+            others = " and ".join(f"{len(x)} {word} incident{'s' if len(x) > 1 else ''}"
+                                  for x, word in ((earlier, "earlier"), (later, "later")) if x)
+            out.append({"level": "warn", "at": None, "text": f"Same spot ({where}) as {others}",
+                        "same_spot": [o["started_at"] for o in earlier + later]})
+        else:
+            out.append({"level": "info", "at": None, "text": f"The only incident at this spot ({where})"})
+    else:
+        out.append({"level": "info", "at": None, "text": "No eero data for this incident, so no location"})
+    if zone:
+        in_zone = [o for o in incidents if (j := next((j for j in jobs if j["started_at"] <= o["started_at"]
+                                                       <= (j["ended_at"] or "9999")), None)) and j["zone"] == zone]
+        out.append({"level": "info", "at": None,
+                    "text": f"Incident {in_zone.index(inc) + 1} of {len(in_zone)} in the {zone}"})
+    return out
+
+
 # --- Home Assistant: long-term statistics and a summary -----------------------------------------
 STATISTICS = {
     # key: (name, unit, unit class, kind, daily row field) - kind "sum" is a running total of the
@@ -480,7 +586,7 @@ def load_zones(path=None) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
-def load_eero_samples(eero_db, device_name: str, since: str | None = None) -> list[tuple]:
+def load_eero_samples(eero_db, device_name: str, since: str | None = None, until: str | None = None) -> list[tuple]:
     """The mower's samples from the eero collector's database (read-only):
     [(observed_at UTC ISO, node location, band, signal dBm)]. [] if the database or device is missing."""
     try:
@@ -489,11 +595,12 @@ def load_eero_samples(eero_db, device_name: str, since: str | None = None) -> li
         return []
     try:
         since_epoch = int(_at(since).timestamp()) if since else 0
+        until_epoch = int(_at(until).timestamp()) if until else 2 ** 62
         rows = conn.execute(
             "SELECT ds.ts, n.location, ds.band, ds.signal FROM device_samples ds"
             " JOIN devices d ON d.id = ds.device_id LEFT JOIN nodes n ON n.id = ds.node_id"
-            " WHERE (d.nickname = ? OR d.display_name = ? OR d.hostname = ?) AND ds.ts >= ? ORDER BY ds.ts",
-            (device_name, device_name, device_name, since_epoch)).fetchall()
+            " WHERE (d.nickname = ? OR d.display_name = ? OR d.hostname = ?) AND ds.ts >= ? AND ds.ts <= ? ORDER BY ds.ts",
+            (device_name, device_name, device_name, since_epoch, until_epoch)).fetchall()
     except sqlite3.Error:
         return []
     finally:
