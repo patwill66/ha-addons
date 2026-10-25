@@ -5,6 +5,7 @@
   python3 scripts/inspect_db.py recent [-n 20]
   python3 scripts/inspect_db.py events [-n 20]
   python3 scripts/inspect_db.py mowing-sessions [-n 20]
+  python3 scripts/inspect_db.py jobs [-n 20]               # mowing sessions grouped into jobs, with outcome
   python3 scripts/inspect_db.py charging-sessions [-n 20]
   python3 scripts/inspect_db.py errors [-n 20]
   python3 scripts/inspect_db.py tasks
@@ -24,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from collector.config import Settings, mask, seconds_between  # noqa: E402
-from collector.derive import ATTENTION_STATES, operational_state  # noqa: E402
+from collector.derive import ATTENTION_STATES, error_category, mowing_jobs, operational_state  # noqa: E402
 
 
 def table(rows, cols):
@@ -45,7 +46,7 @@ def mins(seconds):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["status", "recent", "events", "mowing-sessions", "charging-sessions",
+    ap.add_argument("command", choices=["status", "recent", "events", "mowing-sessions", "jobs", "charging-sessions",
                                         "errors", "tasks", "work-params", "runs", "incidents", "rebuild", "rebuild-sessions"])
     ap.add_argument("-n", type=int, default=20, help="rows to show")
     ap.add_argument("--db", help="database path (default MAMMOTION_DB_PATH or data/mammotion.db)")
@@ -116,6 +117,23 @@ def main() -> int:
         table(rows[::-1], ["id", "started_at", "ended_at", "minutes", "start_battery", "end_battery", "battery_used",
                            "lowest_battery", "pause_count", "end_status", "end_reason", "errors", "uncertain",
                            "why_uncertain"])
+    elif args.command == "jobs":
+        for d in q("SELECT id FROM devices"):
+            latest_real = q("SELECT * FROM telemetry_samples WHERE device_id=? AND raw_status IS NOT NULL"
+                            " ORDER BY observed_at DESC, id DESC LIMIT 1", d["id"])
+            jobs = mowing_jobs(q("SELECT * FROM mowing_sessions WHERE device_id=? ORDER BY started_at", d["id"]),
+                               q("SELECT observed_at, raw_json FROM work_parameter_snapshots WHERE device_id=?", d["id"]),
+                               latest_real[0] if latest_real else None)
+            rows = [j | {"minutes": mins(j["session_seconds"]), "session_ids": ",".join(map(str, j["session_ids"])),
+                         "grouped_by": "inferred" if j["inferred"] else "visual hash", "uncertain": int(j["uncertain"])}
+                    for j in jobs[-n:]]
+            table(rows, ["job", "started_at", "ended_at", "minutes", "session_ids", "recharges", "battery_used",
+                         "off_dock_pauses", "outcome", "grouped_by", "uncertain"])
+            done = [j for j in jobs if j["outcome"] not in ("in_progress", "pending")]
+            if done:
+                ok = sum(j["outcome"] == "completed" for j in done)
+                print(f"\n  {ok} of {len(done)} finished jobs completed; "
+                      f"{sum(j['off_dock_pauses'] > 0 for j in done)} had off-dock pauses (stuck)")
     elif args.command == "charging-sessions":
         rows = [dict(r) | {"minutes": mins(r["elapsed_seconds"]),
                            "why_uncertain": "; ".join(json.loads(r["uncertain_reasons"] or "[]"))}
@@ -125,11 +143,18 @@ def main() -> int:
     elif args.command == "errors":
         total = q("SELECT COUNT(*) c, MIN(occurred_at) a, MAX(occurred_at) b FROM error_events")[0]
         print(f"  {total['c']} records, {total['a']} → {total['b']}")
-        rows = q("SELECT * FROM error_events ORDER BY gmt_create_ms DESC LIMIT ?", n)
-        table(rows, ["occurred_at", "code", "implication", "fault_level", "priority"])
+        rows = [dict(r) | {"category": error_category(r["code"])}
+                for r in q("SELECT * FROM error_events ORDER BY gmt_create_ms DESC LIMIT ?", n)]
+        table(rows, ["occurred_at", "code", "category", "implication", "fault_level", "priority"])
+        by_code = [dict(r) | {"category": error_category(r["code"])}
+                   for r in q("SELECT code, implication, COUNT(*) n FROM error_events GROUP BY code ORDER BY n DESC")]
+        print("\n  By category:")
+        totals = {}
+        for r in by_code:
+            totals[r["category"]] = totals.get(r["category"], 0) + r["n"]
+        table([{"category": c, "n": v} for c, v in sorted(totals.items(), key=lambda x: -x[1])], ["category", "n"])
         print("\n  By code:")
-        table(q("SELECT code, implication, COUNT(*) n FROM error_events GROUP BY code ORDER BY n DESC"),
-              ["code", "n", "implication"])
+        table(by_code, ["code", "category", "n", "implication"])
     elif args.command == "tasks":
         table(q("SELECT task_name, task_id, is_present, first_seen_at, last_seen_at FROM saved_tasks ORDER BY task_name"),
               ["task_name", "task_id", "is_present", "first_seen_at", "last_seen_at"])

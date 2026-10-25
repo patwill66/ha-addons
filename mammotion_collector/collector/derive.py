@@ -18,7 +18,7 @@ from .config import seconds_between
 
 # Bump whenever any rule in this module changes. The collector compares it with the value stored
 # in the database at startup and rebuilds all events and sessions if they differ.
-DERIVATION_VERSION = 2
+DERIVATION_VERSION = 3
 
 # Raw status -> behavioral class. Extend freely; unknown statuses classify as "other" and are
 # still stored verbatim in telemetry_samples.raw_status. Only exact strings seen live (or
@@ -28,6 +28,8 @@ STATUS_CLASSES = {
     "TaskPaused": "paused",      # live value, undocumented
     "Paused": "paused",          # documented
     "Returning": "returning",    # live + documented
+    "Standby": "idle",           # live: idle, on or off the dock (job finished, cancelled or none)
+    "Mapping": "mapping",        # live 2026-10-24 while the user re-recorded boundaries
 }
 JOB_CLASSES = {"mowing", "paused", "returning"}  # states that keep a mowing session open
 
@@ -67,7 +69,8 @@ DOCKED_VALUES = {1, 2, 5}
 
 # Operational states (derived per sample from status + chargeStatus + online):
 #   mowing, returning, docked_charging, docked_waiting (job pending, e.g. do-not-operate window),
-#   docked_charged, paused_off_dock (needs attention), offline, no_data, other
+#   docked_charged, paused_off_dock (needs attention), mapping, idle_off_dock, offline, no_data,
+#   other
 ATTENTION_STATES = {"paused_off_dock"}
 
 
@@ -84,12 +87,16 @@ def operational_state(sample):
         return "mowing"
     if cls == "returning":
         return "returning"
+    if cls == "mapping":
+        return "mapping"
     if sample["charge_status"] in DOCKED_VALUES:
         if is_charging(sample):
             return "docked_charging"
         return "docked_waiting" if cls == "paused" else "docked_charged"
     if cls == "paused" and sample["charge_status"] == 0:
         return "paused_off_dock"
+    if cls == "idle" and sample["charge_status"] == 0:
+        return "idle_off_dock"
     return "other"
 
 
@@ -101,6 +108,8 @@ STATE_LABELS = {
     "docked_waiting": "Docked, job pending",
     "docked_charged": "Docked, charged",
     "paused_off_dock": "Stuck (paused off the dock)",
+    "mapping": "Recording a map",
+    "idle_off_dock": "Idle, off the dock",
     "stuck_powered_off": "Powered off in the yard after getting stuck",
     "offline": "Offline",
     "no_data": "No data",
@@ -127,6 +136,104 @@ def current_condition(latest, last_real) -> dict:
         "last_known_at": last_real["observed_at"] if last_real else None,
         "last_known_battery": last_real["battery_level"] if last_real else None,
     }
+
+
+# Error codes -> category (docs/DATA_INTERPRETATION.md). Codes not listed are "other".
+ERROR_CATEGORIES = {
+    1005: "routine",   # battery low: the normal trip back to the dock to recharge mid-job
+    1026: "schedule",  # stopped and went to recharge because the do-not-operate window began
+    2805: "schedule",  # scheduled task couldn't start: another job was still pending
+    1003: "weather",   # rain sensor
+    1032: "stuck",     # stuck in complex terrain
+    1201: "stuck",     # trapped
+    1006: "stuck",     # battery critically low; so far always logged together with 1201/1032
+    1203: "stuck",     # couldn't return to the dock
+    1214: "stuck",     # channel blocked by obstacles
+    1004: "tilt",      # may be tilted or overturned
+    1030: "tilt",      # lifted or tilted
+    1100: "map",       # outside the task area or inside a no-go zone
+    1102: "map",       # a channel between task areas is required
+    1417: "map",       # invalid task area
+}
+# Categories that are expected notices rather than faults.
+NOTICE_CATEGORIES = {"routine", "schedule", "weather"}
+
+
+def error_category(code) -> str:
+    return ERROR_CATEGORIES.get(code, "other")
+
+
+# --- jobs ---------------------------------------------------------------------------------------
+# A job (one run of a mowing task) spans several mowing sessions when it pauses on the dock to
+# recharge or for the do-not-operate window. The API has no job ID, but /work-params returns
+# `visualHashs`, which changes with every new job and stays the same across its resumes (seen
+# 2026-10-07 to 10-25). Each mowing session takes the hash of the first work-params snapshot taken
+# from up to 5 min before it started (the collector snapshots on entering Mowing, which can be a
+# poll before the session starts) until it ended. Without one, a session continues the latest job
+# if that ended paused on the dock, and the job is marked inferred.
+JOB_HASH_LEAD_SECONDS = 300
+PAUSED_STATUSES = {s for s, c in STATUS_CLASSES.items() if c == "paused"}
+
+
+def _visual_hash(snapshot):
+    try:
+        hashes = json.loads(snapshot["raw_json"]).get("visualHashs")
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return ",".join(str(h) for h in hashes) if hashes else None
+
+
+def mowing_jobs(sessions, work_param_snapshots, latest_real=None) -> list[dict]:
+    """Groups mowing sessions (oldest first) into jobs. `work_param_snapshots` are rows with
+    observed_at and raw_json; `latest_real` is the newest sample with device state, used to tell
+    a job still pending on the dock from one that was dropped. Pure: reads nothing else."""
+    snaps = sorted((s["observed_at"], h) for s in work_param_snapshots if (h := _visual_hash(s)))
+    jobs, by_hash, prev_end, latest = [], {}, None, None
+    for s in sessions:
+        # Never look back into the previous session: its snapshot belongs to that session's job.
+        h = next((h for at, h in snaps if seconds_between(s["started_at"], at) >= -JOB_HASH_LEAD_SECONDS
+                  and (prev_end is None or at > prev_end) and (s["ended_at"] is None or at <= s["ended_at"])), None)
+        prev_end = s["ended_at"]
+        if h is not None and h in by_hash:
+            job = by_hash[h]
+        elif h is None and latest and latest["_last"]["end_status"] in PAUSED_STATUSES \
+                and latest["_last"]["end_reason"] == "charging":
+            job = latest
+            job["inferred"] = True
+        else:
+            job = {"job": len(jobs) + 1, "started_at": s["started_at"], "session_ids": [],
+                   "session_seconds": 0, "battery_used": 0, "off_dock_pauses": 0,
+                   "inferred": h is None, "uncertain": False}
+            jobs.append(job)
+            if h is not None:
+                by_hash[h] = job
+        job["session_ids"].append(s["id"])
+        job["session_seconds"] += s["elapsed_seconds"] or 0
+        job["battery_used"] += s["battery_used"] or 0
+        job["off_dock_pauses"] += s["pause_count"] or 0
+        job["uncertain"] = job["uncertain"] or bool(s["uncertain"])
+        job["_last"] = s
+        latest = job  # the job holding the newest session, even if an older job resumed
+    for job in jobs:
+        last = job.pop("_last")
+        job["sessions"] = len(job["session_ids"])
+        job["recharges"] = job["sessions"] - 1
+        job["ended_at"] = last["ended_at"]
+        job["outcome"] = _job_outcome(last, job is latest, latest_real)
+    return jobs
+
+
+def _job_outcome(last, is_latest, latest_real) -> str:
+    if last["ended_at"] is None:
+        return "in_progress"
+    if last["end_reason"] in ("stuck_powered_off", "offline"):
+        return last["end_reason"]
+    if classify({"online": 1, "raw_status": last["end_status"]}) == "idle":
+        return "completed"  # ended in Standby: finished, or cancelled from the app
+    if last["end_status"] in PAUSED_STATUSES:
+        still_pending = is_latest and latest_real is not None and classify(latest_real) == "paused"
+        return "pending" if still_pending else "not_completed"
+    return "other"
 
 
 def has_telemetry(sample) -> bool:
@@ -211,7 +318,9 @@ class SessionDeriver:
                 reasons.append("no earlier observation; job may have started before collection")
             elif gap_note:
                 reasons.append(gap_note)
-            elif prev_cls in JOB_CLASSES:
+            elif prev_cls in JOB_CLASSES and prev["charge_status"] not in DOCKED_VALUES:
+                # Starting from the dock (job pending, recharged or held by the do-not-operate
+                # window) is an observed start; only a job already running off the dock isn't.
                 reasons.append(f"job already in progress when first seen (previous status {prev['raw_status']})")
             sid = self.store.insert_session(self.MOWING, {
                 "device_id": self.device_id, "started_at": s["observed_at"], "start_sample_id": s["id"],

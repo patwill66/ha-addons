@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 (2026-10-25)
+- Collector **derivation v3** (mammotion-luba `f27482e`). On the first start the collector rebuilds all state events and sessions, logging "Derivation rules changed (now v3)". Telemetry isn't touched.
+- New mower states for `sensor.luba_condition`: `mapping` ("Recording a map") and `idle_off_dock` ("Idle, off the dock"). Both used to show as "Unknown state".
+- Mowing sessions that start from the dock (a scheduled start, or a resume after a recharge or the do-not-operate window) are no longer marked uncertain.
+- The collector can now group sessions into jobs (`derive.mowing_jobs`) and sort errors into categories (`derive.error_category`). The sensors don't publish these yet.
+- The sensors are otherwise unchanged.
+
 ## 0.4.0 (2026-10-08)
 - Collector **derivation v2** (mammotion-luba `fcb926b`): a new `meta` table (schema migration 2) records the rules' version. On the first start the collector rebuilds all state events and sessions, logging "Derivation rules changed (now v2): rebuilt state events and sessions". A mowing session now ends at the last real observation once the mower has been offline for more than 10 minutes. If it was stuck (`paused_off_dock`), the end reason is `stuck_powered_off`.
 - New `sensor.luba_condition`: the mower's condition from the collector's own rules (`derive.current_condition`), such as `docked_waiting`, `paused_off_dock` or `stuck_powered_off`. It has the attributes `label`, `attention`, `last_known_state`, `last_known_at` and `last_known_battery`.
