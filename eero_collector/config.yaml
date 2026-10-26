@@ -1,6 +1,6 @@
 name: "eero Collector"
 description: "Read-only history of an eero mesh network (clients, Wi-Fi quality, usage, mesh health) in SQLite, published to Home Assistant over MQTT."
-version: "0.6.2"
+version: "0.7.0"
 slug: "eero_collector"
 arch:
   - aarch64
@@ -40,6 +40,7 @@ options:
     - "C: eero outside the cabinet"
     - "D: Back to the original placement"
     - "E: Basement eero isolated (optional, disrupts its clients)"
+  mesh_test_clients: []
   baseline_start: ""
   baseline_end: ""
   verbose: false
@@ -57,6 +58,8 @@ schema:
   import_ping: bool
   mesh_test_node: str
   mesh_test_scenarios:
+    - str
+  mesh_test_clients:
     - str
   baseline_start: str
   baseline_end: str

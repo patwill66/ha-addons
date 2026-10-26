@@ -76,6 +76,7 @@ backhaul signal strength, PHY rate or throughput; throughput is only what you en
 | `import_ping` | Copy Home Assistant's Ping readings (`sensor.ping_eero_gateway_*`, `sensor.ping_eero_<eero>_*`, `sensor.ping_internet_google_*` / `_cloudflare_*` and their binary sensors) into the database every 5 minutes, for mesh tests (default on) |
 | `mesh_test_node` | The eero the mesh tests are about (its location name in eero) |
 | `mesh_test_scenarios` | The scenarios offered by *Scenario*, each `CODE: description` |
+| `mesh_test_clients` | Stationary clients whose stability each mesh test also measures: roams and drops per 24 h connected, and time off their main eero (the one they spend the most time on). Same format as `tracked_devices`. Tests that ended before a client was added get it filled in while its 5-minute samples are kept (`sample_retention_days`) |
 | `baseline_start`, `baseline_end` | Optional ISO 8601 window of normal operation, stored as the historical baseline for context |
 
 ## Data

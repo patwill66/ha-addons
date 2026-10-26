@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0 (2026-10-26)
+
+- **Watched clients in mesh tests** (new option `mesh_test_clients`): each test also measures how stable the listed
+  stationary clients were: roams and drops per 24 h connected, their main eero and the share of time off it. The
+  results are frozen at End; tests that ended earlier (and the baseline) get them filled in while the client's
+  5-minute samples are kept. The Mesh Testing comparison and test details show them.
+
 ## 0.6.2 (2026-10-21)
 
 - Signal charts in the Web UI (device pages, What happened?) label their time axis in the add-on's time zone, not UTC.

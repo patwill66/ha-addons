@@ -20,6 +20,12 @@ Definitions (they decide what Home Assistant's "Mesh Testing" view shows):
 - Channels: share of the window each 5/6 GHz channel was in use, from the gateway's radios (eero moves every
   eero's channel together). A trial whose main channel on a band differs from the baseline's gets a warning: a
   channel change alone can move signal and backhaul choices, even when it happened before the trial started.
+- Watched clients (stationary devices whose stability matters, chosen by the caller): over the same window, time
+  connected per eero from the client's own polls (same valid-time rule), its main eero (most time) and the share
+  of connected time off it, roams between eeros (polls) and drops (eero's feed, plus poll-seen drops the feed
+  missed within 10 min), each also per 24 h connected. Raw client samples are pruned after the retention period,
+  so these are frozen at End like the rest; sessions that ended before a client was watched get it added while
+  its samples still cover their window (add_clients).
 eero's API has no backhaul RSSI, PHY rate or throughput; throughput is only what was entered by hand.
 
 Everything above is read-only. The functions under "writes" are the only ones that change the database.
@@ -304,6 +310,31 @@ def channels(db, lo, hi):
     return out
 
 
+def client(db, device_id, name, lo, hi):
+    """One watched client's stability over [lo, hi) (see the module docstring): connected time per eero, its main
+    eero and the share of time off it, roams between eeros and drops, per 24 h connected."""
+    loc = {r["id"]: r["location"] for r in _all(db, "SELECT id, location FROM nodes")}
+    samples = _all(db, "SELECT ts, node_id FROM device_samples WHERE device_id = ? AND ts BETWEEN ? AND ? ORDER BY ts",
+                   device_id, lo - GAP, hi)
+    secs = Counter()
+    for a, b, s in segments(samples, lo, hi):
+        secs[loc.get(s["node_id"], str(s["node_id"]))] += b - a
+    total = sum(secs.values())
+    changes = _all(db, """SELECT ts, kind, source FROM device_changes WHERE device_id = ? AND ts >= ? AND ts < ?
+        AND kind IN ('node', 'disconnected') ORDER BY ts""", device_id, lo, hi)
+    roams = sum(1 for c in changes if c["kind"] == "node" and c["source"] == "poll")
+    feed = [c["ts"] for c in changes if c["kind"] == "disconnected" and c["source"] != "poll"]
+    drops = len(feed) + sum(1 for c in changes if c["kind"] == "disconnected" and c["source"] == "poll"
+                            and not any(abs(t - c["ts"]) <= 600 for t in feed))  # the feed already has it
+    hours = total / 3600
+    main, main_secs = secs.most_common(1)[0] if secs else (None, 0)
+    per_day = lambda n: _r(n / hours * 24) if hours else None  # noqa: E731
+    return {"device_id": device_id, "name": name, "connected_hours": _r(hours, 2),
+            "eero_pct": {k: _r(100 * v / total) for k, v in secs.most_common()} if total else {},
+            "main_eero": main, "off_main_pct": _r(100 - 100 * main_secs / total) if total else None,
+            "roams": roams, "roams_per_24h": per_day(roams), "drops": drops, "drops_per_24h": per_day(drops)}
+
+
 def _channel_warnings(db, start, ch):
     """Warnings for bands whose main channel differs from the baseline's (none for the baseline itself)."""
     base = session(db, BASELINE)
@@ -329,8 +360,9 @@ def settings_of(raw):
     return s
 
 
-def metrics(db, node, start, end, settings, now, tz=datetime.timezone.utc):
-    """Everything measured for one session (see the module docstring for definitions)."""
+def metrics(db, node, start, end, settings, now, tz=datetime.timezone.utc, clients=()):
+    """Everything measured for one session (see the module docstring for definitions). clients: watched
+    [(device id, name)]."""
     settings = settings_of(settings)
     lo = start + int(settings["stabilization_min"] * 60)
     hi = min(end, now) if end else now
@@ -378,7 +410,7 @@ def metrics(db, node, start, end, settings, now, tz=datetime.timezone.utc):
         warnings += differs
         flags.append("channel_differs")
     return {**base, "measuring": True, **r, "latency": lat, "events": ev, "others": others, "channels": ch,
-            "flags": flags, "warnings": warnings}
+            "clients": [client(db, did, name, lo, hi) for did, name in clients], "flags": flags, "warnings": warnings}
 
 
 def series(db, node, lo, hi, target="gateway"):
@@ -474,12 +506,12 @@ def start(db, scenario, name, node, now):
     return session(db, code)
 
 
-def end(db, now, tz=datetime.timezone.utc):
-    """Ends the running trial and freezes its measurements."""
+def end(db, now, tz=datetime.timezone.utc, clients=()):
+    """Ends the running trial and freezes its measurements (with the watched clients')."""
     s = active(db)
     if not s:
         raise MeshTestError("no test is running")
-    summary = metrics(db, s["node"], s["started_at"], now, s["settings"], now, tz)
+    summary = metrics(db, s["node"], s["started_at"], now, s["settings"], now, tz, clients)
     with db:
         db.execute("UPDATE experiments SET ended_at = ?, summary = ?, updated_at = ? WHERE id = ?",
                    (now, json.dumps(summary), now, s["id"]))
@@ -505,6 +537,26 @@ def add_throughput(db, down, up, now, note=None):
         db.execute("INSERT INTO experiment_throughput(experiment_id, ts, down_mbps, up_mbps, note) VALUES(?, ?, ?, ?, ?)",
                    (s["id"], now, down, up, note))
     return s["code"]
+
+
+def add_clients(db, clients, now):
+    """Adds watched clients missing from ended sessions' frozen summaries (sessions that ended before they were
+    watched), while the raw client samples still reach back to the session's window. Returns the codes updated."""
+    oldest = _one(db, "SELECT min(ts) AS ts FROM device_samples").get("ts")
+    done = []
+    for s in sessions(db):
+        m = s["summary"]
+        if not s["ended_at"] or not m or not m.get("measuring") or oldest is None or oldest > m["measure_from"]:
+            continue
+        have = {c["device_id"] for c in m.get("clients") or []}
+        new = [client(db, did, name, m["measure_from"], m["measure_to"]) for did, name in clients if did not in have]
+        if not new:
+            continue
+        m["clients"] = (m.get("clients") or []) + new
+        with db:
+            db.execute("UPDATE experiments SET summary = ?, updated_at = ? WHERE id = ?", (json.dumps(m), now, s["id"]))
+        done.append(s["code"])
+    return done
 
 
 def ensure_baseline(db, node, start, end, now, tz=datetime.timezone.utc):

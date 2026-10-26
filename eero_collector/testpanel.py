@@ -7,6 +7,7 @@ Device "eero Mesh Test":
   baseline, or all tests on one timeline;
 - Status, Active scenario and metric sensors for the viewed session; "Completed tests" carries the comparison rows;
 - images: the session chart and the comparison chart (testchart.py), wide and phone layouts.
+Watched clients (option mesh_test_clients) get their roams, drops and time off their main eero measured per session.
 Commands arrive on eero_collector/mesh_test/<key>/set; publish.py queues them and calls handle() in its loop.
 Sessions live in the collector database (eero-network's collector.meshtest decides what is measured), so the
 results outlast Home Assistant's recorder. Nothing here talks to eero.
@@ -18,6 +19,7 @@ import sqlite3
 import testchart
 from collector import db as store
 from collector import meshtest
+from collector import report
 
 BASE = "eero_collector"
 TOPIC = f"{BASE}/mesh_test"
@@ -127,8 +129,31 @@ def configs(builder_cls, version, scenarios, view_options, others):
     return b.configs
 
 
+def watched(db, entries):
+    """Option mesh_test_clients ('eero name, hostname or MAC [= label]') -> ([(device id, label)], [unknown keys])."""
+    pairs = [(key.strip(), alias.strip() or None) for key, _, alias in (e.partition("=") for e in entries or [])]
+    ids, missing = report.find_devices(db, [key for key, _ in pairs if key])
+    found = [(key, alias) for key, alias in pairs if key and key not in missing]
+    out = []
+    for (key, alias), did in zip(found, ids):
+        row = db.execute("SELECT * FROM devices WHERE id = ?", (did,)).fetchone()
+        out.append((did, alias or (report.device_name(dict(row)) if row else key)))
+    return out, missing
+
+
+def add_clients(db_path, entries, now):
+    """Adds watched clients to sessions that ended before they were watched (see meshtest.add_clients)."""
+    if not entries:
+        return []
+    db = store.connect(db_path)
+    try:
+        return meshtest.add_clients(db, watched(db, entries)[0], now)
+    finally:
+        db.close()
+
+
 # --- commands ----------------------------------------------------------------------------------------------------
-def handle(db_path, key, payload, scenarios, node, tz, now):
+def handle(db_path, key, payload, scenarios, node, tz, now, clients=()):
     """Applies one command and returns a short message for the Status sensor."""
     text = payload.decode(errors="replace").strip() if isinstance(payload, bytes) else str(payload).strip()
     db = store.connect(db_path)
@@ -145,7 +170,7 @@ def handle(db_path, key, payload, scenarios, node, tz, now):
             meshtest.set_draft(db, view=CURRENT)
             return f"Started {s['code']} ({name})."
         if key == "end":
-            s = meshtest.end(db, now, tz)
+            s = meshtest.end(db, now, tz, watched(db, clients)[0])
             hours = (s["ended_at"] - s["started_at"]) / 3600
             return f"Ended {s['code']} after {hours:.1f} h."
         if key == "notes":
@@ -203,6 +228,7 @@ def _flat(m, kind, label, code, name, measured_by):
         "flags": m.get("flags") or [], "warnings": m.get("warnings") or [],
         "events": [{"at": iso(e["ts"]), "text": e["text"]} for e in (m.get("events") or [])][-15:],
         "others": m.get("others") or {}, "settings": m.get("settings") or {},
+        "clients": m.get("clients") or [],
     }
 
 
@@ -223,10 +249,10 @@ def _row(s, m):
             "throughput_down_median": downs[len(downs) // 2] if downs else None,
             "throughput_up_median": ups[len(ups) // 2] if ups else None, "throughput_n": len(tp),
             "flags": m.get("flags") or [], "warnings": m.get("warnings") or [], "notes": s.get("notes"),
-            "settings": s.get("settings") or {}}
+            "settings": s.get("settings") or {}, "clients": {str(c["device_id"]): c for c in m.get("clients") or []}}
 
 
-def state(db_path, node, scenarios, tz, now, message=None):
+def state(db_path, node, scenarios, tz, now, message=None, clients=()):
     """Everything publish.py sends: (main payload, viewed-session attributes, comparison attributes, view options,
     other satellites, charts {key: svg})."""
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
@@ -239,13 +265,14 @@ def state(db_path, node, scenarios, tz, now, message=None):
             return None
         gateway = meshtest.gateway_name(db)
         sats = meshtest.satellites(db)
+        watch, unknown = watched(db, clients)
         others = [s for s in sats if s != node]
         completed = [t for t in trials if t["ended_at"]]
         labels = {session_label(t, tz): t for t in completed}
         options = [CURRENT, *labels, *([BASELINE_VIEW] if base else []), ALL]
         view = d.get("view") if d.get("view") in options else CURRENT
 
-        live = meshtest.metrics(db, act["node"], act["started_at"], None, act["settings"], now, tz) if act else None
+        live = meshtest.metrics(db, act["node"], act["started_at"], None, act["settings"], now, tz, watch) if act else None
         if view in (CURRENT, ALL):
             sel = act or (completed[-1] if completed else None)
         elif view == BASELINE_VIEW:
@@ -296,7 +323,8 @@ def state(db_path, node, scenarios, tz, now, message=None):
                                                          bs.get("measure_to") or base["ended_at"] or now)
             if sel is not None and sel["id"] == base["id"]:
                 selected["channels"] = baseline_row["channels"]
-        comparison = {"trials": rows, "baseline": baseline_row,
+        comparison = {"trials": rows, "baseline": baseline_row, "clients": [{"id": str(did), "name": name} for did, name in watch],
+                      "clients_unknown": unknown,
                       "baseline_note": "Normal operation before testing; uncontrolled, not a comparable trial."}
 
         # charts end at the latest eero data, not at "now", so a picture only changes when new data arrives

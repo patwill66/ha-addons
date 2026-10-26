@@ -342,9 +342,11 @@ def picker_detail(db_path, device_id, label, tz):
 
 class Publisher:
     def __init__(self, broker, db_path, tracked, interval, timezone, version, source, log, test_node=None,
-                 scenarios=()):
+                 scenarios=(), test_clients=()):
         self.broker, self.db_path, self.tracked = broker, db_path, tracked
         self.test_node, self.scenarios = test_node, testpanel.parse_scenarios(scenarios)
+        self.test_clients = list(test_clients)  # option mesh_test_clients
+        self.warned_test_clients = set()
         self.commands = []  # mesh test commands from MQTT, applied in the publishing loop
         self.test_message = None
         self.test_shape = None  # view options and other satellites last announced in discovery
@@ -397,7 +399,7 @@ class Publisher:
             key, payload = self.commands.pop(0)
             try:
                 msg = testpanel.handle(self.db_path, key, payload, self.scenarios, self.test_node, self.tz,
-                                       int(time.time()))
+                                       int(time.time()), self.test_clients)
             except Exception as e:  # a bad command must not stop publishing
                 msg = f"{key} failed: {e}"
             if msg:
@@ -414,8 +416,14 @@ class Publisher:
         self.apply_commands()
         net, nodes, node_states, clients, missing, choices, maps = collect(self.db_path, self.tracked, self.tz,
                                                                            self.version, self.source)
+        if self.test_node and self.test_clients:
+            for code in testpanel.add_clients(self.db_path, self.test_clients, int(time.time())):
+                self.log(f"mesh test: added watched clients to {code}")
         test = testpanel.state(self.db_path, self.test_node, self.scenarios, self.tz, int(time.time()),
-                               self.test_message) if self.test_node else None
+                               self.test_message, self.test_clients) if self.test_node else None
+        for key in set(test[2]["clients_unknown"] if test else []) - self.warned_test_clients:
+            self.log(f"mesh test client not found: {key!r} (use its eero name or MAC)")
+        self.warned_test_clients = set(test[2]["clients_unknown"]) if test else set()
         if test and (test[3], test[4]) != self.test_shape:
             self.resend = True
         options = [label for _, label in choices]

@@ -94,7 +94,8 @@ def main():
             broker = publish.broker_from_supervisor(token)
             pub = publish.Publisher(broker, str(DB), options.get("tracked_devices", []),
                                     int(options.get("publish_seconds", 60)), timezone, version, source, log,
-                                    test_node=test_node, scenarios=options.get("mesh_test_scenarios", []))
+                                    test_node=test_node, scenarios=options.get("mesh_test_scenarios", []),
+                                    test_clients=options.get("mesh_test_clients", []))
             threading.Thread(target=pub.run, daemon=True, args=(stop,)).start()
         except Exception as e:
             log(f"MQTT not available ({e}); sensors won't be published. Is the Mosquitto broker add-on running?")
