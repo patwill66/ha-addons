@@ -160,6 +160,14 @@ MIGRATIONS = [
         PRIMARY KEY (target, metric, bucket)
     ) WITHOUT ROWID;
     """,
+    # 3 - network notes: what the user noticed (a call froze, a page stalled), timestamped when entered
+    """
+    -- experiment: code of the mesh test running when the note was entered (NULL if none). Kept for good.
+    CREATE TABLE feedback (
+        id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, text TEXT NOT NULL, experiment TEXT, source TEXT
+    );
+    CREATE INDEX feedback_ts ON feedback(ts);
+    """,
 ]
 
 

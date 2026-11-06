@@ -16,11 +16,15 @@ current summaries, and publishes one retained JSON state per HA device:
                                        dashboard lists (kept in /data/event_filter.json; display only)
   eero_collector/mesh_test[/...]    -> device "eero Mesh Test": backhaul placement tests (testpanel.py);
                                        its controls send commands on eero_collector/mesh_test/<key>/set
+  eero_collector/feedback           -> text "Network note" on "eero Network": the user types what they noticed
+                                       (a call froze, a page stalled); each note arrives on .../feedback/set and
+                                       is stored with its time (collector.feedback); the recent ones are attributes
 Discovery configs (homeassistant/<component>/eero_collector/<object>/config, retained) are sent at
 start and again whenever Home Assistant announces itself on homeassistant/status. Configs of entities
 that disappear (a client no longer tracked) are cleared. Availability follows the MQTT last will.
 The picker only chooses what this add-on shows; the choice is kept in /data/picker.json. Mesh test
-commands are the only writes: they record test sessions in the collector database. Nothing here talks to eero.
+commands and network notes are the only writes: they record test sessions and notes in the collector
+database. Nothing here talks to eero.
 """
 
 import datetime
@@ -34,6 +38,8 @@ from zoneinfo import ZoneInfo
 import meshmap
 import mqtt
 import testpanel
+from collector import db as store
+from collector import feedback
 from collector import report
 
 BASE = "eero_collector"
@@ -51,6 +57,9 @@ DEVICE_EVENTS = 100  # recent connection events per tracked device (the dashboar
 MESH_CHANGES = 40  # recent mesh changes (report.mesh_changes, last 7 days) on "eero Network"
 SIGNAL_ROWS = 20  # rows of a tracked device's signal per eero, band and channel (last 30 days)
 MAP_LAYOUTS = (("wide", "mesh_map", "Mesh map"), ("tall", "mesh_map_phone", "Mesh map (phone)"))
+FEEDBACK_TOPIC = f"{BASE}/feedback"
+FEEDBACK_SET = f"{FEEDBACK_TOPIC}/set"
+FEEDBACK_NOTES = 25  # recent network notes listed on the dashboard
 
 
 def iso(epoch):
@@ -161,7 +170,42 @@ def network_configs(version):
     for layout, key, name in MAP_LAYOUTS:
         b.add("image", key, name, None, icon="mdi:sitemap", image_topic=f"{BASE}/mesh_map/{layout}",
               content_type="image/svg+xml")
+    # Empty after every note, so the box is ready for the next one; the notes themselves are attributes.
+    b.add("text", "feedback", "Network note", v("value"), state_topic=FEEDBACK_TOPIC, attrs_topic=FEEDBACK_TOPIC,
+          command_topic=FEEDBACK_SET, icon="mdi:comment-text-outline", min=0, max=255, mode="text")
     return b.configs
+
+
+def save_notes(db_path, queue):
+    """Stores and removes queued notes [(epoch, text)], oldest first; returns (saved, epoch of the last one).
+    If the database is busy, it raises and the unsaved notes stay queued for the next try."""
+    db = store.connect(db_path)
+    saved, last = 0, None
+    try:
+        while queue:
+            ts, text = queue[0]
+            try:
+                feedback.add(db, text, ts, source="home_assistant")
+                saved += 1
+            except feedback.FeedbackError:
+                pass  # an empty note
+            last = ts
+            queue.pop(0)
+    finally:
+        db.close()
+    return saved, last
+
+
+def feedback_state(db_path, tz, message=None):
+    """The text entity's state: always empty, with the recent notes (newest first) as attributes."""
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    try:
+        notes, n = feedback.recent(db, FEEDBACK_NOTES), feedback.count(db)
+    finally:
+        db.close()
+    return {"value": "", "message": message, "count": n,
+            "notes": [{"at": iso(x["ts"]), "when": datetime.datetime.fromtimestamp(x["ts"], tz).strftime("%a %b %-d %H:%M"),
+                       "text": x["text"], "test": x["experiment"]} for x in notes]}
 
 
 def picker_configs(version, options):
@@ -348,6 +392,8 @@ class Publisher:
         self.test_clients = list(test_clients)  # option mesh_test_clients
         self.warned_test_clients = set()
         self.commands = []  # mesh test commands from MQTT, applied in the publishing loop
+        self.notes = []  # network notes from MQTT [(arrival epoch, text)], saved in the publishing loop
+        self.feedback_message = None
         self.test_message = None
         self.test_shape = None  # view options and other satellites last announced in discovery
         self.test_images = {}
@@ -381,6 +427,9 @@ class Publisher:
                 self.filter_changed = True
         elif topic.startswith(testpanel.TOPIC + "/") and topic.endswith("/set"):
             self.commands.append((topic[len(testpanel.TOPIC) + 1:-4], payload))
+        elif topic == FEEDBACK_SET:
+            # Timestamped on arrival: the note is about this moment, not when the loop gets to it.
+            self.notes.append((int(time.time()), payload.decode(errors="replace")))
 
     def connect(self):
         self.client = mqtt.Client(self.broker["host"], int(self.broker["port"]), self.broker.get("username"),
@@ -391,6 +440,7 @@ class Publisher:
         self.client.subscribe(PICKER_SET)
         self.client.subscribe(testpanel.SET)
         self.client.subscribe(f"{FILTER_TOPIC}/+/set")
+        self.client.subscribe(FEEDBACK_SET)
         self.client.publish(AVAIL, "online", retain=True)
         self.resend = True
 
@@ -405,6 +455,16 @@ class Publisher:
             if msg:
                 self.test_message = f"{time.strftime('%H:%M')} {msg}"
                 self.log(f"mesh test: {msg}")
+
+    def publish_feedback(self):
+        if self.notes:
+            saved, last = save_notes(self.db_path, self.notes)
+            when = datetime.datetime.fromtimestamp(last, self.tz).strftime("%H:%M")
+            self.feedback_message = f"Saved at {when}." if saved else "Nothing saved: the note was empty."
+            if saved:
+                self.log(f"network note saved ({saved})")
+        self.client.publish(FEEDBACK_TOPIC, json.dumps(feedback_state(self.db_path, self.tz, self.feedback_message)),
+                            retain=True)
 
     def publish_filter(self):
         if self.filter_changed:
@@ -467,6 +527,7 @@ class Publisher:
             time.sleep(1)  # let HA create the entities before the first states arrive
         self.client.publish(f"{BASE}/network", json.dumps(net, default=str), retain=True)
         self.publish_filter()
+        self.publish_feedback()
         for nid, st in node_states.items():
             self.client.publish(f"{BASE}/node/{nid}", json.dumps(st), retain=True)
         for did, st in clients.items():
@@ -504,6 +565,8 @@ class Publisher:
                 for _ in range(self.interval):
                     if self.filter_changed:  # a switch flipped: answer at once, without a full refresh
                         self.publish_filter()
+                    if self.notes:  # a note arrived: save it and clear the box at once
+                        self.publish_feedback()
                     if stop.wait(1) or self.resend or self.picked is not None or self.commands:
                         break
                     self.client.ping_if_idle()

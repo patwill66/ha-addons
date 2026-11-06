@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0 (2026-11-05)
+
+- **Network note** (text on eero Network): log what you notice as it happens (a Teams call froze, a page stalled, a
+  device dropped). Each note is saved in the collector database with the time it arrived and the mesh test running
+  then, and the box clears for the next one. The newest 25 are its attributes; the Network dashboard's new Feedback
+  view lists them. Database schema 3 (new `feedback` table, added automatically).
+
 ## 0.7.0 (2026-10-26)
 
 - **Watched clients in mesh tests** (new option `mesh_test_clients`): each test also measures how stable the listed

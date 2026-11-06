@@ -40,6 +40,11 @@ band and channel over 30 days, which shows what a channel change did to that dev
 attributes). *Last mesh change* on eero Network lists the last 7 days of restarts, firmware and channel changes,
 upstream eero changes, collector gaps and internet outages.
 
+**Network note:** a text box on eero Network for logging what you notice as it happens (a Teams call froze, a page
+stalled, a device dropped). Type and press Enter: the note is saved in the collector database with the time it
+arrived and the mesh test running then, and the box clears. The newest 25 notes are its attributes (the Network
+dashboard's Feedback view lists them); all of them stay in the database for later analysis.
+
 **Mesh Test:** a device for controlled backhaul tests, such as moving an eero or opening a cabinet. Pick a
 *Scenario*, add *Notes*, press *Start test*, and *End test* when done. The first *Stabilization period* minutes
 aren't measured. Results count only valid time: 5-minute samples with a reported upstream; missed polls don't count

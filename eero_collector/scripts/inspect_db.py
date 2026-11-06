@@ -7,6 +7,7 @@
   python3 scripts/inspect_db.py usage [--days 7]        # network usage per day
   python3 scripts/inspect_db.py changes [--hours 24]    # device changes (new, connect, roam, band, ip)
   python3 scripts/inspect_db.py events [--hours 24]     # eero's event feed
+  python3 scripts/inspect_db.py feedback [--days 7]     # network notes the user logged (and the test running)
 
 --db PATH (default data/eero.db, or EERO_DB_PATH). Output contains device names and MACs: don't paste it
 anywhere public.
@@ -22,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from collector import db as dbmod, report  # noqa: E402
+from collector import db as dbmod, feedback, report  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 TABLES = ("network_samples", "node_samples", "radio_samples", "devices", "device_samples", "device_hourly",
@@ -36,7 +37,7 @@ def when(epoch, tz):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", choices=["status", "nodes", "devices", "usage", "changes", "events"])
+    p.add_argument("cmd", choices=["status", "nodes", "devices", "usage", "changes", "events", "feedback"])
     p.add_argument("--db", default=os.environ.get("EERO_DB_PATH", str(ROOT / "data" / "eero.db")))
     p.add_argument("--all", action="store_true")
     p.add_argument("--days", type=int, default=7)
@@ -79,6 +80,9 @@ def main():
     elif a.cmd == "events":
         for r in db.execute("SELECT * FROM events WHERE ts_ms >= ? ORDER BY ts_ms", ((now - a.hours * 3600) * 1000,)):
             print(f"{when(r['ts_ms'] // 1000, tz)}  {r['description']}")
+    elif a.cmd == "feedback":
+        for n in feedback.between(db, now - a.days * 86400, now + 1):
+            print(f"{when(n['ts'], tz)}  {n['experiment'] or '-':8} {n['text']}")
 
 
 if __name__ == "__main__":
