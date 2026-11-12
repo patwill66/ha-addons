@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.1 (2026-11-11)
+
+- **Fix: ping latency stopped being recorded** after Home Assistant's Ping readings had two values in the same second
+  with one unavailable (seen 2026-11-09 during an eero firmware update). Mesh tests since then showed "No latency
+  readings" and one long ping outage. The import now resumes where it stopped and fills in everything HA's recorder
+  still holds.
+- **Snapshot download** can be gzip-compressed (`snapshot?gzip=1`, linked on the status page), which gets the full
+  database through Nabu Casa's cutoff of about a minute.
+
 ## 0.8.0 (2026-11-05)
 
 - **Network note** (text on eero Network): log what you notice as it happens (a Teams call froze, a page stalled, a

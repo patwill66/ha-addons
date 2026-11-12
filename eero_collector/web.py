@@ -5,18 +5,21 @@
   GET  devices          every device eero knows: sortable, searchable table
   GET  device?id=N      one device: link quality, signal per eero/band/channel, usage and change history
   GET  incident         "What happened?": one device and the mesh around a moment (?id=N&at=YYYY-MM-DDTHH:MM&win=min)
-  GET  snapshot         a consistent copy of the database (SQLite online backup, read-only)
+  GET  snapshot         a consistent copy of the database (SQLite online backup, read-only); ?gzip=1 sends it
+                        gzip-compressed, which gets through Nabu Casa before its cutoff of about a minute
 
 Only the Supervisor's ingress proxy may connect; Home Assistant authenticates the user. The database
 is opened read-only. The only eero calls made here are the two login POSTs, on the user's request.
 """
 
 import datetime
+import gzip
 import hashlib
 import html
 import http.server
 import json
 import pathlib
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -194,7 +197,8 @@ class App:
                      f"<td>{ago(t['last_ok_at'], now)}</td><td class=muted>{e(t['last_error'] or '')}</td></tr>")
         body += "</table><h2>eero API calls, last 24 hours</h2><table><tr><th>Endpoint</th><th class=n>Status</th><th class=n>Calls</th><th class=n>Avg ms</th></tr>"
         body += "".join(f"<tr><td>{e(c['path'])}</td><td class=n>{c['status']}</td><td class=n>{c['calls']}</td><td class=n>{c['ms']}</td></tr>" for c in calls)
-        body += "</table><p><a href='snapshot'>Download a database snapshot</a></p>"
+        body += ("</table><p><a href='snapshot'>Download a database snapshot</a> (a consistent copy, made while the collector "
+                 "keeps running) or <a href='snapshot?gzip=1'>a gzip-compressed one</a> (<code>gunzip</code> it to get the .db file)</p>")
         return page("eero Network", body)
 
     def login_form(self, logged_in, state=None):
@@ -441,6 +445,14 @@ class App:
         return self.status("Logged in. The collector resumes within a few seconds.")
 
 
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def make_handler(app):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "EeroCollector"
@@ -470,7 +482,7 @@ def make_handler(app):
                 elif path == "/incident":
                     self.reply(app.incident(q))
                 elif path == "/snapshot":
-                    self.snapshot()
+                    self.snapshot(compress=q.get("gzip", [""])[0] == "1")
                 else:
                     self.send_error(404)
             except Exception as err:  # a page error must never take the add-on down
@@ -498,7 +510,9 @@ def make_handler(app):
             self.end_headers()
             self.wfile.write(body)
 
-        def snapshot(self):
+        def snapshot(self, compress=False):
+            """X-Snapshot-Sha256 is always the database's own SHA-256; a compressed download adds
+            X-Snapshot-Gzip-Sha256 for the file as sent."""
             stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             with app.snapshot_lock, tempfile.TemporaryDirectory(prefix="snapshot-") as tmp:
                 copy = pathlib.Path(tmp) / "eero.db"
@@ -510,16 +524,25 @@ def make_handler(app):
                 finally:
                     src.close()
                     dst.close()
-                digest = hashlib.sha256(copy.read_bytes()).hexdigest()
+                digest = sha256(copy)
+                sent, name, kind = copy, f"eero-{stamp}.db", "application/vnd.sqlite3"
+                if compress:
+                    sent, name, kind = copy.with_suffix(".db.gz"), name + ".gz", "application/gzip"
+                    with copy.open("rb") as f, gzip.open(sent, "wb", compresslevel=6) as g:
+                        shutil.copyfileobj(f, g, 1 << 20)
+                size = sent.stat().st_size
                 self.send_response(200)
-                self.send_header("Content-Type", "application/vnd.sqlite3")
-                self.send_header("Content-Length", str(copy.stat().st_size))
-                self.send_header("Content-Disposition", f'attachment; filename="eero-{stamp}.db"')
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
                 self.send_header("X-Snapshot-Sha256", digest)
+                if compress:
+                    self.send_header("X-Snapshot-Gzip-Sha256", sha256(sent))
                 self.end_headers()
-                with copy.open("rb") as f:
+                with sent.open("rb") as f:
                     for block in iter(lambda: f.read(CHUNK), b""):
                         self.wfile.write(block)
+            app.log(f"served snapshot ({size // 1024} KB{', gzip' if compress else ''})")
     return Handler
 
 

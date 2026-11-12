@@ -583,8 +583,9 @@ def ensure_baseline(db, node, start, end, now, tz=datetime.timezone.utc):
 
 def ingest_ping(db, target, metric, rows, now, retention_days=35):
     """Stores prober readings [(ts, value or None)], refreshes the 5-minute aggregates they touch and prunes
-    readings older than `retention_days` (the aggregates stay)."""
-    rows = sorted((int(t), v) for t, v in rows)
+    readings older than `retention_days` (the aggregates stay). Readings that round to the same second (a window's
+    start state and a change just after it) keep their order, so the later one is stored."""
+    rows = sorted(((int(t), v) for t, v in rows), key=lambda r: r[0])
     if rows:
         with db:
             db.executemany("INSERT OR REPLACE INTO ping_samples VALUES(?, ?, ?, ?)",

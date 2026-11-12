@@ -88,4 +88,5 @@ backhaul signal strength, PHY rate or throughput; throughput is only what you en
 
 `/share/eero_collector/eero.db` (part of HA's full backups). Expect about 2–4 MB a day while client
 samples are kept, then roughly 60 MB a year for hourly summaries and usage. **Open Web UI → Download a
-database snapshot** gives a consistent copy.
+database snapshot** gives a consistent copy; the gzip-compressed one (`snapshot?gzip=1`) is a fraction of the
+size and gets through Nabu Casa, which cuts transfers off after about a minute.
